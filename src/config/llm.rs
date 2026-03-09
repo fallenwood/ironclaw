@@ -756,6 +756,43 @@ mod tests {
     }
 
     #[test]
+    fn registry_provider_resolves_github_copilot_alias() {
+        let _guard = ENV_MUTEX.lock().expect("env mutex poisoned");
+        // SAFETY: Under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("LLM_BACKEND", "github-copilot");
+            std::env::set_var("GITHUB_COPILOT_TOKEN", "gho_test_token");
+            std::env::set_var(
+                "GITHUB_COPILOT_EXTRA_HEADERS",
+                "Copilot-Integration-Id:vscode-chat",
+            );
+        }
+
+        let settings = Settings::default();
+
+        let cfg = LlmConfig::resolve(&settings).expect("resolve should succeed");
+        assert_eq!(cfg.backend, "github_copilot");
+        let provider = cfg.provider.expect("provider config should be present");
+        assert_eq!(provider.provider_id, "github_copilot");
+        assert_eq!(provider.base_url, "https://api.githubcopilot.com");
+        assert_eq!(provider.model, "gpt-4o");
+        assert_eq!(
+            provider.extra_headers,
+            vec![(
+                "Copilot-Integration-Id".to_string(),
+                "vscode-chat".to_string(),
+            )]
+        );
+
+        // SAFETY: Under ENV_MUTEX.
+        unsafe {
+            std::env::remove_var("LLM_BACKEND");
+            std::env::remove_var("GITHUB_COPILOT_TOKEN");
+            std::env::remove_var("GITHUB_COPILOT_EXTRA_HEADERS");
+        }
+    }
+
+    #[test]
     fn nearai_backend_has_no_registry_provider() {
         let _guard = ENV_MUTEX.lock().expect("env mutex poisoned");
         // SAFETY: Under ENV_MUTEX.

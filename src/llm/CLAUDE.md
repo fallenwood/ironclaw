@@ -29,9 +29,22 @@ Set via `LLM_BACKEND` env var:
 | `nearai` (default) | NEAR AI Chat Completions | `NEARAI_SESSION_TOKEN` or `NEARAI_API_KEY` |
 | `openai` | OpenAI | `OPENAI_API_KEY` |
 | `anthropic` | Anthropic | `ANTHROPIC_API_KEY` |
+| `github_copilot` | GitHub Copilot Chat API | `GITHUB_COPILOT_TOKEN`, `GITHUB_COPILOT_MODEL` |
 | `ollama` | Ollama local | `OLLAMA_BASE_URL` |
 | `openai_compatible` | Any OpenAI-compatible endpoint | `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL` |
 | `tinfoil` | Tinfoil TEE inference | `TINFOIL_API_KEY`, `TINFOIL_MODEL` |
+
+## GitHub Copilot Provider Notes
+
+`github_copilot` is a declarative registry provider backed by the existing
+OpenAI-compatible path. It defaults to `https://api.githubcopilot.com` and expects a
+GitHub Copilot OAuth token in `GITHUB_COPILOT_TOKEN` (for example the `oauth_token`
+stored by your IDE sign-in flow in `~/.config/github-copilot/apps.json`).
+
+Manual model entry is used in the setup wizard (`can_list_models = false`) because
+GitHub Copilot model discovery can require extra integration headers on some clients.
+Advanced users can still inject headers like `Copilot-Integration-Id:vscode-chat` via
+`GITHUB_COPILOT_EXTRA_HEADERS`.
 
 ## NEAR AI Provider Gotchas
 

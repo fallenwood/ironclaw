@@ -171,6 +171,7 @@ env-var mode or skipped secrets.
 | NEAR AI Cloud | API key | `llm_nearai_api_key` | `NEARAI_API_KEY` |
 | Anthropic | API key | `anthropic_api_key` | `ANTHROPIC_API_KEY` |
 | OpenAI | API key | `openai_api_key` | `OPENAI_API_KEY` |
+| GitHub Copilot | OAuth token | `llm_github_copilot_token` | `GITHUB_COPILOT_TOKEN` |
 | Ollama | None | - | - |
 | OpenRouter¹ | API key | `llm_compatible_api_key` | `LLM_API_KEY` |
 | OpenAI-compatible¹ | Optional API key | `llm_compatible_api_key` | `LLM_API_KEY` |
@@ -480,7 +481,7 @@ pub struct Settings {
     pub secrets_master_key_source: KeySource, // Keychain | Env | None
 
     // Step 3: Inference
-    pub llm_backend: Option<String>,         // "nearai" | "anthropic" | "openai" | "ollama" | "openai_compatible" | "bedrock"
+    pub llm_backend: Option<String>,         // "nearai" | "anthropic" | "openai" | "github_copilot" | "ollama" | "openai_compatible" | "bedrock"
     pub ollama_base_url: Option<String>,
     pub openai_compatible_base_url: Option<String>,
 
