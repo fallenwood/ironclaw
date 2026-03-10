@@ -295,6 +295,14 @@ impl LlmConfig {
         } else {
             Vec::new()
         };
+        let extra_headers = if canonical_id == "github_copilot" {
+            merge_extra_headers(
+                crate::llm::github_copilot_auth::default_headers(),
+                extra_headers,
+            )
+        } else {
+            extra_headers
+        };
 
         // Resolve OAuth token (Anthropic-specific: `claude login` flow).
         // Only check for OAuth token when the provider is actually Anthropic.
@@ -373,6 +381,26 @@ fn parse_extra_headers(val: &str) -> Result<Vec<(String, String)>, ConfigError> 
         headers.push((key.to_string(), value.trim().to_string()));
     }
     Ok(headers)
+}
+
+fn merge_extra_headers(
+    defaults: Vec<(String, String)>,
+    overrides: Vec<(String, String)>,
+) -> Vec<(String, String)> {
+    let mut merged = Vec::new();
+    let mut positions = std::collections::HashMap::<String, usize>::new();
+
+    for (key, value) in defaults.into_iter().chain(overrides) {
+        let normalized = key.to_ascii_lowercase();
+        if let Some(existing_index) = positions.get(&normalized).copied() {
+            merged[existing_index] = (key, value);
+        } else {
+            positions.insert(normalized, merged.len());
+            merged.push((key, value));
+        }
+    }
+
+    merged
 }
 
 /// Get the default session file path (~/.ironclaw/session.json).
@@ -505,6 +533,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn merge_extra_headers_prefers_overrides_case_insensitively() {
+        let merged = merge_extra_headers(
+            vec![
+                ("User-Agent".to_string(), "default-agent".to_string()),
+                ("X-Test".to_string(), "default".to_string()),
+            ],
+            vec![
+                ("user-agent".to_string(), "override-agent".to_string()),
+                ("X-Extra".to_string(), "present".to_string()),
+            ],
+        );
+
+        assert_eq!(
+            merged,
+            vec![
+                ("user-agent".to_string(), "override-agent".to_string()),
+                ("X-Test".to_string(), "default".to_string()),
+                ("X-Extra".to_string(), "present".to_string()),
+            ]
+        );
+    }
+
     /// Clear all ollama-related env vars.
     fn clear_ollama_env() {
         // SAFETY: Only called under ENV_MUTEX in tests.
@@ -624,6 +675,54 @@ mod tests {
         let provider = cfg.provider.expect("provider config should be present");
         assert_eq!(provider.base_url, "https://inference.tinfoil.sh/v1");
         assert_eq!(provider.model, "kimi-k2-5");
+    }
+
+    #[test]
+    fn registry_provider_resolves_github_copilot_alias() {
+        let _guard = ENV_MUTEX.lock().expect("env mutex poisoned");
+        // SAFETY: Under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("LLM_BACKEND", "github-copilot");
+            std::env::set_var("GITHUB_COPILOT_TOKEN", "gho_test_token");
+            std::env::set_var(
+                "GITHUB_COPILOT_EXTRA_HEADERS",
+                "Copilot-Integration-Id:custom-chat,X-Test:enabled",
+            );
+        }
+
+        let settings = Settings::default();
+
+        let cfg = LlmConfig::resolve(&settings).expect("resolve should succeed");
+        assert_eq!(cfg.backend, "github_copilot");
+        let provider = cfg.provider.expect("provider config should be present");
+        assert_eq!(provider.provider_id, "github_copilot");
+        assert_eq!(provider.base_url, "https://api.githubcopilot.com");
+        assert_eq!(provider.model, "gpt-4o");
+        assert!(
+            provider
+                .extra_headers
+                .iter()
+                .any(|(key, value)| { key == "Copilot-Integration-Id" && value == "custom-chat" })
+        );
+        assert!(
+            provider
+                .extra_headers
+                .iter()
+                .any(|(key, value)| key == "User-Agent" && value == "GitHubCopilotChat/0.26.7")
+        );
+        assert!(
+            provider
+                .extra_headers
+                .iter()
+                .any(|(key, value)| key == "X-Test" && value == "enabled")
+        );
+
+        // SAFETY: Under ENV_MUTEX.
+        unsafe {
+            std::env::remove_var("LLM_BACKEND");
+            std::env::remove_var("GITHUB_COPILOT_TOKEN");
+            std::env::remove_var("GITHUB_COPILOT_EXTRA_HEADERS");
+        }
     }
 
     #[test]

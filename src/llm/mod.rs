@@ -16,6 +16,7 @@ pub mod config;
 pub mod costs;
 pub mod error;
 pub mod failover;
+pub(crate) mod github_copilot_auth;
 mod nearai_chat;
 pub mod oauth_helpers;
 mod provider;

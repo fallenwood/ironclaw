@@ -165,9 +165,13 @@ written to `~/.ironclaw/.env` so they are available before the database connects
 
 ### Alternative LLM Providers
 
-IronClaw defaults to NEAR AI but works with any OpenAI-compatible endpoint.
-Popular options include **OpenRouter** (300+ models), **Together AI**, **Fireworks AI**,
-**Ollama** (local), and self-hosted servers like **vLLM** or **LiteLLM**.
+IronClaw defaults to NEAR AI but also supports direct providers like **GitHub Copilot**,
+**OpenAI**, **Anthropic**, plus OpenAI-compatible endpoints such as **OpenRouter**
+(300+ models), **Together AI**, **Fireworks AI**, **Ollama** (local), and self-hosted
+servers like **vLLM** or **LiteLLM**.
+
+For GitHub Copilot, `ironclaw onboard` can walk you through GitHub device login and
+save the resulting token for reuse.
 
 Select *"OpenAI-compatible"* in the wizard, or set environment variables directly:
 

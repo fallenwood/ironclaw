@@ -6,23 +6,24 @@ configurations.
 
 ## Provider Overview
 
-| Provider | Backend value | Requires API key | Notes |
+| Provider | Backend value | Credential env var | Notes |
 |---|---|---|---|
-| NEAR AI | `nearai` | OAuth (browser) | Default; multi-model |
+| NEAR AI | `nearai` | `NEARAI_SESSION_TOKEN` or `NEARAI_API_KEY` | Default; multi-model |
 | Anthropic | `anthropic` | `ANTHROPIC_API_KEY` | Claude models |
 | OpenAI | `openai` | `OPENAI_API_KEY` | GPT models |
+| GitHub Copilot | `github_copilot` | `GITHUB_COPILOT_TOKEN` | OpenAI-style endpoint backed by your Copilot subscription |
 | Google Gemini | `gemini` | `GEMINI_API_KEY` | Gemini models |
 | io.net | `ionet` | `IONET_API_KEY` | Intelligence API |
 | Mistral | `mistral` | `MISTRAL_API_KEY` | Mistral models |
 | Yandex AI Studio | `yandex` | `YANDEX_API_KEY` | YandexGPT models |
 | Cloudflare Workers AI | `cloudflare` | `CLOUDFLARE_API_KEY` | Access to Workers AI |
-| Ollama | `ollama` | No | Local inference |
+| Ollama | `ollama` | None | Local inference |
 | AWS Bedrock | `bedrock` | AWS credentials | Native Converse API |
 | OpenRouter | `openai_compatible` | `LLM_API_KEY` | 300+ models |
 | Together AI | `openai_compatible` | `LLM_API_KEY` | Fast inference |
 | Fireworks AI | `openai_compatible` | `LLM_API_KEY` | Fast inference |
 | vLLM / LiteLLM | `openai_compatible` | Optional | Self-hosted |
-| LM Studio | `openai_compatible` | No | Local GUI |
+| LM Studio | `openai_compatible` | None | Local GUI |
 
 ---
 
@@ -57,6 +58,34 @@ OPENAI_API_KEY=sk-...
 ```
 
 Popular models: `gpt-4o`, `gpt-4o-mini`, `o3-mini`
+
+---
+
+## GitHub Copilot
+
+GitHub Copilot exposes an OpenAI-style chat endpoint at
+`https://api.githubcopilot.com`. IronClaw uses that endpoint directly through the
+built-in `github_copilot` provider.
+
+```env
+LLM_BACKEND=github_copilot
+GITHUB_COPILOT_TOKEN=gho_...
+GITHUB_COPILOT_MODEL=gpt-4o
+# Optional advanced headers if your setup needs them:
+# GITHUB_COPILOT_EXTRA_HEADERS=Copilot-Integration-Id:vscode-chat
+```
+
+`ironclaw onboard` can acquire this token for you using GitHub device login. If you
+already signed into Copilot through VS Code or a JetBrains IDE, you can also reuse
+the `oauth_token` stored in `~/.config/github-copilot/apps.json`. If you prefer,
+`LLM_BACKEND=github-copilot` also works as an alias.
+
+Popular models vary by subscription, but `gpt-4o` is a safe default. IronClaw keeps
+model entry manual for this provider because GitHub Copilot model listing may require
+extra integration headers on some clients. IronClaw automatically injects the standard
+VS Code identity headers (`User-Agent`, `Editor-Version`, `Editor-Plugin-Version`,
+`Copilot-Integration-Id`) and lets you override them with
+`GITHUB_COPILOT_EXTRA_HEADERS`.
 
 ---
 
