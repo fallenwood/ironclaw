@@ -75,13 +75,17 @@ GITHUB_COPILOT_MODEL=gpt-4o
 # GITHUB_COPILOT_EXTRA_HEADERS=Copilot-Integration-Id:vscode-chat
 ```
 
-The token is the `oauth_token` from your GitHub Copilot IDE sign-in, commonly found
-in `~/.config/github-copilot/apps.json` after signing in through VS Code or a
-JetBrains IDE. If you prefer, `LLM_BACKEND=github-copilot` also works as an alias.
+`ironclaw onboard` can acquire this token for you using GitHub device login. If you
+already signed into Copilot through VS Code or a JetBrains IDE, you can also reuse
+the `oauth_token` stored in `~/.config/github-copilot/apps.json`. If you prefer,
+`LLM_BACKEND=github-copilot` also works as an alias.
 
 Popular models vary by subscription, but `gpt-4o` is a safe default. IronClaw keeps
 model entry manual for this provider because GitHub Copilot model listing may require
-extra integration headers on some clients.
+extra integration headers on some clients. IronClaw automatically injects the standard
+VS Code identity headers (`User-Agent`, `Editor-Version`, `Editor-Plugin-Version`,
+`Copilot-Integration-Id`) and lets you override them with
+`GITHUB_COPILOT_EXTRA_HEADERS`.
 
 ---
 

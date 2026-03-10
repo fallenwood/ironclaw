@@ -170,6 +170,9 @@ IronClaw defaults to NEAR AI but also supports direct providers like **GitHub Co
 (300+ models), **Together AI**, **Fireworks AI**, **Ollama** (local), and self-hosted
 servers like **vLLM** or **LiteLLM**.
 
+For GitHub Copilot, `ironclaw onboard` can walk you through GitHub device login and
+save the resulting token for reuse.
+
 Select *"OpenAI-compatible"* in the wizard, or set environment variables directly:
 
 ```env

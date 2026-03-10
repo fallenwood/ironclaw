@@ -193,6 +193,12 @@ Switching between them overwrites the same credential slot.
 3. Store encrypted in secrets via `init_secrets_context()`
 4. **Cache key in `self.llm_api_key`** for model fetching in Step 4
 
+**GitHub Copilot** (`setup_github_copilot`):
+- Offers **GitHub device login** (recommended) or manual token paste
+- Device login uses the VS Code Copilot OAuth client and stores the resulting token as `llm_github_copilot_token`
+- Validates the token against `https://api.githubcopilot.com/models` before saving
+- Injects `GITHUB_COPILOT_TOKEN` into the config overlay for immediate provider use
+
 **NEAR AI** (`setup_nearai`):
 - Calls `session_manager.ensure_authenticated()` which shows the auth menu:
   - Options 1-2 (GitHub/Google): browser OAuth → **NEAR AI Chat** mode

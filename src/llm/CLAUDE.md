@@ -39,11 +39,15 @@ Set via `LLM_BACKEND` env var:
 `github_copilot` is a declarative registry provider backed by the existing
 OpenAI-compatible path. It defaults to `https://api.githubcopilot.com` and expects a
 GitHub Copilot OAuth token in `GITHUB_COPILOT_TOKEN` (for example the `oauth_token`
-stored by your IDE sign-in flow in `~/.config/github-copilot/apps.json`).
+stored by your IDE sign-in flow in `~/.config/github-copilot/apps.json`). The setup
+wizard also supports GitHub device login using the VS Code Copilot client ID and then
+stores the resulting token in the encrypted secrets store.
 
 Manual model entry is used in the setup wizard (`can_list_models = false`) because
 GitHub Copilot model discovery can require extra integration headers on some clients.
-Advanced users can still inject headers like `Copilot-Integration-Id:vscode-chat` via
+IronClaw injects the standard VS Code identity headers automatically:
+`User-Agent`, `Editor-Version`, `Editor-Plugin-Version`, and
+`Copilot-Integration-Id`. Advanced users can still override or append headers via
 `GITHUB_COPILOT_EXTRA_HEADERS`.
 
 ## NEAR AI Provider Gotchas

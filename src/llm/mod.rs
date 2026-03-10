@@ -14,6 +14,7 @@ mod bedrock;
 pub mod circuit_breaker;
 pub mod costs;
 pub mod failover;
+pub(crate) mod github_copilot_auth;
 mod nearai_chat;
 mod provider;
 mod reasoning;

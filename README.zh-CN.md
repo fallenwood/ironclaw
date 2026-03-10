@@ -167,6 +167,8 @@ IronClaw 默认使用 NEAR AI，同时也支持 **GitHub Copilot**、**OpenAI**�
 **Together AI**、**Fireworks AI**、**Ollama**（本地部署）以及自托管服务器如
 **vLLM** 或 **LiteLLM**。
 
+对于 GitHub Copilot，`ironclaw onboard` 现在可以通过 GitHub 设备登录流程获取并保存令牌。
+
 在向导中选择 *"OpenAI-compatible"*，或直接设置环境变量：
 
 ```env
