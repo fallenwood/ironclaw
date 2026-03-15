@@ -84,7 +84,7 @@
       "githubcopilot",
       "copilot"
     ],
-    "protocol": "open_ai_completions",
+    "protocol": "github_copilot",
     "default_base_url": "https://api.githubcopilot.com",
     "api_key_env": "GITHUB_COPILOT_TOKEN",
     "api_key_required": true,
