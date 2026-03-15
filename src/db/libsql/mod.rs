@@ -16,6 +16,7 @@ mod workspace;
 
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDateTime, Utc};
@@ -31,6 +32,8 @@ use crate::error::DatabaseError;
 use crate::workspace::MemoryDocument;
 
 use crate::db::libsql_migrations;
+
+static NAIVE_TIMESTAMP_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// Explicit column list for routines table (matches positional access in `row_to_routine_libsql`).
 pub(crate) const ROUTINE_COLUMNS: &str = "\
@@ -163,24 +166,27 @@ impl LibSqlBackend {
 ///
 /// Returns an error if none of the formats match.
 pub(crate) fn parse_timestamp(s: &str) -> Result<DateTime<Utc>, String> {
+    let log_naive_timestamp_once = || {
+        if !NAIVE_TIMESTAMP_LOGGED.swap(true, Ordering::Relaxed) {
+            tracing::debug!(
+                timestamp = %s,
+                "parsed naive timestamp without timezone; assuming UTC for backward compatibility"
+            );
+        }
+    };
+
     // RFC 3339 (our canonical write format)
     if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
         return Ok(dt.with_timezone(&Utc));
     }
     // Naive with fractional seconds (legacy or SQLite datetime() output)
     if let Ok(ndt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f") {
-        tracing::warn!(
-            timestamp = %s,
-            "parsed naive timestamp without timezone; assuming UTC for backward compatibility"
-        );
+        log_naive_timestamp_once();
         return Ok(ndt.and_utc());
     }
     // Naive without fractional seconds (legacy format)
     if let Ok(ndt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
-        tracing::warn!(
-            timestamp = %s,
-            "parsed naive timestamp without timezone; assuming UTC for backward compatibility"
-        );
+        log_naive_timestamp_once();
         return Ok(ndt.and_utc());
     }
     Err(format!("unparseable timestamp: {:?}", s))
@@ -480,6 +486,24 @@ mod tests {
         let row = rows.next().await.unwrap().unwrap();
         let timeout: i64 = row.get(0).unwrap();
         assert_eq!(timeout, 5000);
+    }
+
+    /// Regression test: save_job must persist user_id and get_job must return it.
+    #[tokio::test]
+    async fn test_save_job_persists_user_id() {
+        use crate::context::JobContext;
+        use crate::db::JobStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test_user_id.db");
+        let backend = LibSqlBackend::new_local(&db_path).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let ctx = JobContext::with_user("test-user-42", "Test Job", "A test job");
+        backend.save_job(&ctx).await.unwrap();
+
+        let loaded = backend.get_job(ctx.job_id).await.unwrap().unwrap();
+        assert_eq!(loaded.user_id, "test-user-42");
     }
 
     #[tokio::test]

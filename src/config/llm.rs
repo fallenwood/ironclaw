@@ -209,6 +209,7 @@ impl LlmConfig {
             extra_headers_env,
             api_key_required,
             base_url_required,
+            unsupported_params,
         ) = if let Some(def) = def {
             (
                 def.id.as_str(),
@@ -221,6 +222,7 @@ impl LlmConfig {
                 def.extra_headers_env.as_deref(),
                 def.api_key_required,
                 def.base_url_required,
+                def.unsupported_params.clone(),
             )
         } else {
             // Absolute fallback: treat as generic openai_completions
@@ -235,6 +237,7 @@ impl LlmConfig {
                 Some("LLM_EXTRA_HEADERS"),
                 false,
                 true,
+                Vec::new(),
             )
         };
 
@@ -346,6 +349,7 @@ impl LlmConfig {
             extra_headers,
             oauth_token,
             cache_retention,
+            unsupported_params,
         })
     }
 }
@@ -413,6 +417,7 @@ mod tests {
     use super::*;
     use crate::config::helpers::ENV_MUTEX;
     use crate::settings::Settings;
+    use crate::testing::credentials::*;
 
     /// Clear all openai-compatible-related env vars.
     fn clear_openai_compatible_env() {
@@ -675,6 +680,37 @@ mod tests {
         let provider = cfg.provider.expect("provider config should be present");
         assert_eq!(provider.base_url, "https://inference.tinfoil.sh/v1");
         assert_eq!(provider.model, "kimi-k2-5");
+        assert!(
+            provider
+                .unsupported_params
+                .contains(&"temperature".to_string()),
+            "tinfoil should propagate unsupported_params from registry"
+        );
+    }
+
+    #[test]
+    fn registry_provider_alias_resolves_zai() {
+        let _guard = ENV_MUTEX.lock().expect("env mutex poisoned");
+        // SAFETY: Under ENV_MUTEX.
+        unsafe {
+            std::env::remove_var("LLM_BACKEND");
+            std::env::remove_var("ZAI_API_KEY");
+            std::env::remove_var("ZAI_MODEL");
+        }
+
+        let settings = Settings {
+            llm_backend: Some("bigmodel".to_string()),
+            selected_model: Some("glm-5".to_string()),
+            ..Default::default()
+        };
+
+        let cfg = LlmConfig::resolve(&settings).expect("resolve should succeed");
+        assert_eq!(cfg.backend, "zai");
+        let provider = cfg.provider.expect("provider config should be present");
+        assert_eq!(provider.provider_id, "zai");
+        assert_eq!(provider.model, "glm-5");
+        assert_eq!(provider.base_url, "https://api.z.ai/api/paas/v4");
+        assert_eq!(provider.protocol, ProviderProtocol::OpenAiCompletions);
     }
 
     #[test]
@@ -746,7 +782,7 @@ mod tests {
         // SAFETY: Under ENV_MUTEX.
         unsafe {
             std::env::set_var("LLM_BACKEND", "open_ai");
-            std::env::set_var("OPENAI_API_KEY", "test-key");
+            std::env::set_var("OPENAI_API_KEY", TEST_API_KEY);
         }
 
         let settings = Settings::default();
@@ -880,7 +916,7 @@ mod tests {
         clear_anthropic_env();
         // SAFETY: Under ENV_MUTEX.
         unsafe {
-            std::env::set_var("ANTHROPIC_OAUTH_TOKEN", "sk-ant-oat01-test-token");
+            std::env::set_var("ANTHROPIC_OAUTH_TOKEN", TEST_ANTHROPIC_OAUTH_TOKEN);
         }
 
         let settings = Settings {
@@ -904,7 +940,7 @@ mod tests {
         );
         assert_eq!(
             provider.oauth_token.as_ref().unwrap().expose_secret(),
-            "sk-ant-oat01-test-token"
+            TEST_ANTHROPIC_OAUTH_TOKEN
         );
 
         clear_anthropic_env();
@@ -918,8 +954,8 @@ mod tests {
         clear_anthropic_env();
         // SAFETY: Under ENV_MUTEX.
         unsafe {
-            std::env::set_var("ANTHROPIC_API_KEY", "sk-ant-real-key");
-            std::env::set_var("ANTHROPIC_OAUTH_TOKEN", "sk-ant-oat01-test-token");
+            std::env::set_var("ANTHROPIC_API_KEY", TEST_ANTHROPIC_API_KEY);
+            std::env::set_var("ANTHROPIC_OAUTH_TOKEN", TEST_ANTHROPIC_OAUTH_TOKEN);
         }
 
         let settings = Settings {
@@ -934,7 +970,7 @@ mod tests {
                 .api_key
                 .as_ref()
                 .map(|k| k.expose_secret().to_string()),
-            Some("sk-ant-real-key".to_string()),
+            Some(TEST_ANTHROPIC_API_KEY.to_string()),
             "real API key should take priority over OAuth placeholder"
         );
         assert!(
@@ -951,7 +987,7 @@ mod tests {
         clear_anthropic_env();
         // SAFETY: Under ENV_MUTEX.
         unsafe {
-            std::env::set_var("ANTHROPIC_OAUTH_TOKEN", "sk-ant-oat01-test-token");
+            std::env::set_var("ANTHROPIC_OAUTH_TOKEN", TEST_ANTHROPIC_OAUTH_TOKEN);
         }
 
         let settings = Settings {
