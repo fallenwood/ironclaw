@@ -17,7 +17,8 @@
 <p align="center">
   <a href="README.md">English</a> |
   <a href="README.zh-CN.md">简体中文</a> |
-  <a href="README.ru.md">Русский</a>
+  <a href="README.ru.md">Русский</a> |
+  <a href="README.ja.md">日本語</a>
 </p>
 
 <p align="center">
@@ -166,17 +167,20 @@ written to `~/.ironclaw/.env` so they are available before the database connects
 
 ### Alternative LLM Providers
 
-IronClaw defaults to NEAR AI but also supports direct providers like **GitHub Copilot**,
-**OpenAI**, **Anthropic**, plus OpenAI-compatible endpoints such as **OpenRouter**
-(300+ models), **Together AI**, **Fireworks AI**, **Ollama** (local), and self-hosted
-servers like **vLLM** or **LiteLLM**.
+IronClaw defaults to NEAR AI but supports many LLM providers out of the box.
+Built-in providers include **Anthropic**, **OpenAI**, **GitHub Copilot**, **Google Gemini**, **MiniMax**,
+**Mistral**, and **Ollama** (local). OpenAI-compatible services like **OpenRouter**
+(300+ models), **Together AI**, **Fireworks AI**, and self-hosted servers (**vLLM**,
+**LiteLLM**) are also supported.
 
-For GitHub Copilot, `ironclaw onboard` can walk you through GitHub device login and
-save the resulting token for reuse.
-
-Select *"OpenAI-compatible"* in the wizard, or set environment variables directly:
+Select your provider in the wizard, or set environment variables directly:
 
 ```env
+# Example: MiniMax (built-in, 204K context)
+LLM_BACKEND=minimax
+MINIMAX_API_KEY=...
+
+# Example: OpenAI-compatible endpoint
 LLM_BACKEND=openai_compatible
 LLM_BASE_URL=https://openrouter.ai/api/v1
 LLM_API_KEY=sk-or-...

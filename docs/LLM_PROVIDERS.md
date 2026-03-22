@@ -16,9 +16,10 @@ configurations.
 | io.net | `ionet` | `IONET_API_KEY` | Intelligence API |
 | Mistral | `mistral` | `MISTRAL_API_KEY` | Mistral models |
 | Yandex AI Studio | `yandex` | `YANDEX_API_KEY` | YandexGPT models |
-| MiniMax | `minimax` | `MINIMAX_API_KEY` | MiniMax-M2.5 models |
+| MiniMax | `minimax` | `MINIMAX_API_KEY` | MiniMax-M2.7 models |
 | Cloudflare Workers AI | `cloudflare` | `CLOUDFLARE_API_KEY` | Access to Workers AI |
-| Ollama | `ollama` | None | Local inference |
+| GitHub Copilot | `github_copilot` | `GITHUB_COPILOT_TOKEN` | Multi-models |
+| Ollama | `ollama` | No | Local inference |
 | AWS Bedrock | `bedrock` | AWS credentials | Native Converse API |
 | OpenRouter | `openai_compatible` | `LLM_API_KEY` | 300+ models |
 | Together AI | `openai_compatible` | `LLM_API_KEY` | Fast inference |
@@ -64,7 +65,7 @@ Popular models: `gpt-4o`, `gpt-4o-mini`, `o3-mini`
 
 ## GitHub Copilot
 
-GitHub Copilot exposes an OpenAI-style chat endpoint at
+GitHub Copilot exposes chat endpoint at
 `https://api.githubcopilot.com`. IronClaw uses that endpoint directly through the
 built-in `github_copilot` provider.
 
@@ -113,7 +114,7 @@ LLM_BACKEND=minimax
 MINIMAX_API_KEY=...
 ```
 
-Available models: `MiniMax-M2.5` (default), `MiniMax-M2.5-highspeed`
+Available models: `MiniMax-M2.7` (default), `MiniMax-M2.7-highspeed`, `MiniMax-M2.5`, `MiniMax-M2.5-highspeed`
 
 To use the China mainland endpoint, set:
 

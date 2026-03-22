@@ -24,8 +24,8 @@ use crate::llm::error::LlmError;
 use crate::llm::github_copilot_auth::CopilotTokenManager;
 use crate::llm::provider::{
     ChatMessage, CompletionRequest, CompletionResponse, ContentPart, FinishReason, LlmProvider,
-    Role, ToolCall, ToolCompletionRequest, ToolCompletionResponse, strip_unsupported_completion_params,
-    strip_unsupported_tool_params,
+    Role, ToolCall, ToolCompletionRequest, ToolCompletionResponse,
+    strip_unsupported_completion_params, strip_unsupported_tool_params,
 };
 
 /// GitHub Copilot provider with automatic token exchange.
@@ -41,7 +41,10 @@ pub struct GithubCopilotProvider {
 }
 
 impl GithubCopilotProvider {
-    pub fn new(config: &RegistryProviderConfig) -> Result<Self, LlmError> {
+    pub fn new(
+        config: &RegistryProviderConfig,
+        request_timeout_secs: u64,
+    ) -> Result<Self, LlmError> {
         let oauth_token = config
             .api_key
             .as_ref()
@@ -54,7 +57,7 @@ impl GithubCopilotProvider {
             })?;
 
         let client = Client::builder()
-            .timeout(std::time::Duration::from_secs(120))
+            .timeout(std::time::Duration::from_secs(request_timeout_secs))
             .build()
             .map_err(|e| LlmError::RequestFailed {
                 provider: "github_copilot".to_string(),
@@ -104,22 +107,21 @@ impl GithubCopilotProvider {
         body: &impl Serialize,
     ) -> Result<R, LlmError> {
         let url = self.api_url();
-        let token = self
-            .token_manager
-            .get_token()
-            .await
-            .map_err(|e| {
-                tracing::warn!(error = %e, "Copilot: token exchange failed");
-                LlmError::RequestFailed {
-                    provider: "github_copilot".to_string(),
-                    reason: format!("Token exchange failed: {e}"),
-                }
-            })?;
+        // Map token exchange failures to RequestFailed (retryable) rather than
+        // AuthFailed (non-retryable), since transient network errors during
+        // exchange should be retried by RetryProvider.
+        let token = self.token_manager.get_token().await.map_err(|e| {
+            tracing::warn!(error = %e, "Copilot: token exchange failed");
+            LlmError::RequestFailed {
+                provider: "github_copilot".to_string(),
+                reason: format!("Token exchange failed: {e}"),
+            }
+        })?;
 
         let mut request = self
             .client
             .post(&url)
-            .bearer_auth(&token)
+            .bearer_auth(token.expose_secret())
             .header("Content-Type", "application/json");
 
         // Inject Copilot identity headers
@@ -138,12 +140,10 @@ impl GithubCopilotProvider {
         let status = response.status();
 
         if !status.is_success() {
-            let retry_after = response
-                .headers()
-                .get("retry-after")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.parse::<u64>().ok())
-                .map(std::time::Duration::from_secs);
+            // Use shared retry-after parser (supports HTTP-date, default 60s)
+            let retry_after = Some(crate::llm::retry::parse_retry_after(
+                response.headers().get(reqwest::header::RETRY_AFTER),
+            ));
 
             let response_text = response
                 .text()
@@ -157,13 +157,54 @@ impl GithubCopilotProvider {
             );
 
             if status.as_u16() == 401 {
-                // Invalidate the cached session token so the next attempt
-                // performs a fresh token exchange.
-                tracing::warn!("Copilot: 401 Unauthorized — invalidating cached session token for retry");
+                // Invalidate the cached session token and retry once with a
+                // fresh exchange — stale tokens are the most common 401 cause.
+                tracing::warn!("Copilot: 401 Unauthorized — invalidating session token, retrying");
                 self.token_manager.invalidate().await;
-                return Err(LlmError::RequestFailed {
+                let fresh = self.token_manager.get_token().await.map_err(|e| {
+                    tracing::warn!(error = %e, "Copilot: re-exchange after 401 failed");
+                    LlmError::RequestFailed {
+                        provider: "github_copilot".to_string(),
+                        reason: format!("Token re-exchange after 401 failed: {e}"),
+                    }
+                })?;
+                let mut retry_req = self
+                    .client
+                    .post(&url)
+                    .bearer_auth(fresh.expose_secret())
+                    .header("Content-Type", "application/json");
+                for (key, value) in &self.extra_headers {
+                    retry_req = retry_req.header(key.as_str(), value.as_str());
+                }
+                let retry =
+                    retry_req
+                        .json(body)
+                        .send()
+                        .await
+                        .map_err(|e| LlmError::RequestFailed {
+                            provider: "github_copilot".to_string(),
+                            reason: format!("Retry after 401 failed: {e}"),
+                        })?;
+                if retry.status().is_success() {
+                    let text = retry.text().await.map_err(|e| LlmError::RequestFailed {
+                        provider: "github_copilot".to_string(),
+                        reason: format!("Failed to read retry response body: {e}"),
+                    })?;
+                    return serde_json::from_str(&text).map_err(|e| {
+                        let truncated = crate::agent::truncate_for_preview(&text, 512);
+                        LlmError::InvalidResponse {
+                            provider: "github_copilot".to_string(),
+                            reason: format!("JSON parse error: {e}. Raw: {truncated}"),
+                        }
+                    });
+                }
+                let retry_status = retry.status();
+                tracing::warn!(
+                    status = %retry_status,
+                    "Copilot: 401 retry also failed"
+                );
+                return Err(LlmError::AuthFailed {
                     provider: "github_copilot".to_string(),
-                    reason: format!("HTTP 401 Unauthorized (stale session token invalidated): {response_text}"),
                 });
             }
             if status.as_u16() == 429 {
@@ -212,19 +253,21 @@ impl LlmProvider for GithubCopilotProvider {
             messages,
             max_tokens: req.max_tokens,
             temperature: req.temperature,
+            stop: req.stop_sequences,
             tools: None,
             tool_choice: None,
         };
 
         let response: OpenAiResponse = self.send_request(&request).await?;
-        let choice = response
-            .choices
-            .into_iter()
-            .next()
-            .ok_or_else(|| LlmError::InvalidResponse {
-                provider: "github_copilot".to_string(),
-                reason: "No choices in response".to_string(),
-            })?;
+        let choice =
+            response
+                .choices
+                .into_iter()
+                .next()
+                .ok_or_else(|| LlmError::InvalidResponse {
+                    provider: "github_copilot".to_string(),
+                    reason: "No choices in response".to_string(),
+                })?;
 
         let (content, _tool_calls) = extract_choice_content(&choice);
 
@@ -288,19 +331,21 @@ impl LlmProvider for GithubCopilotProvider {
             messages,
             max_tokens: req.max_tokens,
             temperature: req.temperature,
+            stop: req.stop_sequences,
             tools: if tools.is_empty() { None } else { Some(tools) },
             tool_choice,
         };
 
         let response: OpenAiResponse = self.send_request(&request).await?;
-        let choice = response
-            .choices
-            .into_iter()
-            .next()
-            .ok_or_else(|| LlmError::InvalidResponse {
-                provider: "github_copilot".to_string(),
-                reason: "No choices in response".to_string(),
-            })?;
+        let choice =
+            response
+                .choices
+                .into_iter()
+                .next()
+                .ok_or_else(|| LlmError::InvalidResponse {
+                    provider: "github_copilot".to_string(),
+                    reason: "No choices in response".to_string(),
+                })?;
 
         let (content, tool_calls) = extract_choice_content(&choice);
 
@@ -376,6 +421,8 @@ struct OpenAiRequest {
     max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stop: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<OpenAiTool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -503,12 +550,20 @@ fn convert_messages(messages: Vec<ChatMessage>) -> Vec<OpenAiMessage> {
                 let content = if msg.content_parts.is_empty() {
                     Some(OpenAiContent::Text(msg.content))
                 } else {
-                    let mut parts = vec![OpenAiContentPart::Text { text: msg.content }];
+                    let mut parts = Vec::with_capacity(1 + msg.content_parts.len());
+                    if !msg.content.is_empty() {
+                        parts.push(OpenAiContentPart::Text { text: msg.content });
+                    }
                     for part in msg.content_parts {
-                        if let ContentPart::ImageUrl { image_url } = part {
-                            parts.push(OpenAiContentPart::ImageUrl {
-                                image_url: OpenAiImageUrl { url: image_url.url },
-                            });
+                        match part {
+                            ContentPart::Text { text } => {
+                                parts.push(OpenAiContentPart::Text { text });
+                            }
+                            ContentPart::ImageUrl { image_url } => {
+                                parts.push(OpenAiContentPart::ImageUrl {
+                                    image_url: OpenAiImageUrl { url: image_url.url },
+                                });
+                            }
                         }
                     }
                     Some(OpenAiContent::Parts(parts))
