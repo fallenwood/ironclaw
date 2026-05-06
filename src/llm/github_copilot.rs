@@ -27,6 +27,7 @@ use crate::llm::provider::{
     Role, ToolCall, ToolCompletionRequest, ToolCompletionResponse,
     strip_unsupported_completion_params, strip_unsupported_tool_params,
 };
+use crate::llm::tool_schema::{ToolSchemaPolicy, shape_tool_schema};
 
 /// GitHub Copilot provider with automatic token exchange.
 pub struct GithubCopilotProvider {
@@ -278,13 +279,21 @@ impl LlmProvider for GithubCopilotProvider {
         let tools: Vec<OpenAiTool> = req
             .tools
             .into_iter()
-            .map(|t| OpenAiTool {
-                tool_type: "function".to_string(),
-                function: OpenAiFunction {
-                    name: t.name,
-                    description: t.description,
-                    parameters: t.parameters,
-                },
+            .map(|t| {
+                let mut description = t.description;
+                let parameters = shape_tool_schema(
+                    ToolSchemaPolicy::StrictOpenAi,
+                    &t.parameters,
+                    &mut description,
+                );
+                OpenAiTool {
+                    tool_type: "function".to_string(),
+                    function: OpenAiFunction {
+                        name: t.name,
+                        description,
+                        parameters,
+                    },
+                }
             })
             .collect();
 
