@@ -27,19 +27,29 @@
 //! WASM channels allow dynamic loading of channel implementations at runtime.
 //! See the [`wasm`] module for details.
 
+mod attachments;
 mod channel;
 mod http;
 mod manager;
 pub mod relay;
 mod repl;
 mod signal;
+#[cfg(feature = "tui")]
+pub mod tui;
 pub mod wasm;
 pub mod web;
 mod webhook_server;
 
+#[cfg(feature = "tui")]
+pub use self::tui::TuiChannel;
+pub(crate) use attachments::{
+    MAX_INLINE_ATTACHMENT_BYTES, MAX_INLINE_ATTACHMENTS, MAX_INLINE_TOTAL_ATTACHMENT_BYTES,
+    attachment_extension_for_mime,
+};
 pub use channel::{
-    AttachmentKind, Channel, ChannelSecretUpdater, IncomingAttachment, IncomingMessage,
-    MessageStream, OutgoingResponse, StatusUpdate, routing_target_from_metadata,
+    AttachmentKind, Channel, ChannelSecretUpdater, ChatApprovalPrompt, EngineThreadSummary,
+    HistoryMessage, IncomingAttachment, IncomingMessage, MessageStream, OutgoingResponse,
+    StatusUpdate, ThreadSummary, ToolDecision, routing_target_from_metadata,
 };
 pub use http::{HttpChannel, HttpChannelState};
 pub use manager::ChannelManager;

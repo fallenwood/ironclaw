@@ -21,7 +21,8 @@
   <a href="README.md">English</a> |
   <a href="README.zh-CN.md">简体中文</a> |
   <a href="README.ru.md">Русский</a> |
-  <a href="README.ja.md">日本語</a>
+  <a href="README.ja.md">日本語</a> |
+  <a href="README.ko.md">한국어</a>
 </p>
 
 <p align="center">
@@ -83,7 +84,7 @@ IronClaw is the AI assistant you can actually trust with your personal and profe
 
 ### Prerequisites
 
-- Rust 1.85+
+- Rust 1.92+
 - PostgreSQL 15+ with [pgvector](https://github.com/pgvector/pgvector) extension
 - NEAR AI account (authentication handled via setup wizard)
 
@@ -190,7 +191,7 @@ LLM_API_KEY=sk-or-...
 LLM_MODEL=anthropic/claude-sonnet-4
 ```
 
-See [docs/LLM_PROVIDERS.md](docs/LLM_PROVIDERS.md) for a full provider guide.
+See [docs/capabilities/llm-providers.md](docs/capabilities/llm-providers.md) for a full provider guide.
 
 ## Security
 
@@ -285,6 +286,8 @@ External content passes through multiple security layers:
 
 ## Usage
 
+Engine v2 is opt-in right now. If you want to run the new engine instead of the legacy agent loop, start IronClaw with `ENGINE_V2=true`. See [Engine v2 architecture](docs/internal/engine-v2-architecture.md#enabling-engine-v2) for more details.
+
 ```bash
 # First-time setup (configures database, auth, etc.)
 ironclaw onboard
@@ -292,8 +295,11 @@ ironclaw onboard
 # Start interactive REPL
 cargo run
 
-# With debug logging
-RUST_LOG=ironclaw=debug cargo run
+# Start interactive REPL with engine v2
+ENGINE_V2=true cargo run
+
+# Engine v2 with debug logging
+ENGINE_V2=true RUST_LOG=ironclaw=debug cargo run
 ```
 
 ## Development
@@ -313,7 +319,7 @@ cargo test
 cargo test test_name
 ```
 
-- **Telegram channel**: See [docs/TELEGRAM_SETUP.md](docs/TELEGRAM_SETUP.md) for setup and DM pairing.
+- **Channels**: See [docs/channels/overview.mdx](docs/channels/overview.mdx) for setup of Telegram, Discord, and other channels.
 - **Changing channel sources**: Run `./channels-src/telegram/build.sh` before `cargo build` so the updated WASM is bundled.
 
 ## OpenClaw Heritage

@@ -20,12 +20,13 @@ jobs:
     if: contains(github.event.pull_request.labels.*.name, 'staging-promotion')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Run Claude Code review
-        uses: anthropics/claude-code-action@v1
+        uses: anthropics/claude-code-action@1eddb334cfa79fdb21ecbe2180ca1a016e8e7d47 # v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           allowed_bots: "ironclaw-ci[bot]"
@@ -81,9 +82,11 @@ jobs:
                timeouts, resource leaks (file handles, connections), large allocations
                in hot paths.
 
-            4. Consolidate all agent findings and post exactly one comment on the PR
-               using `gh pr comment` with this format. If no issues were found,
-               post "No issues found." instead:
+            4. Consolidate all agent findings and post exactly one comment on
+               THIS promotion PR (#${{ github.event.pull_request.number }})
+               using `gh pr comment ${{ github.event.pull_request.number }}`.
+               Do NOT comment on the original source PRs — only on this promotion PR.
+               If no issues were found, post "No issues found." instead:
 
             ### Code review
 
@@ -107,3 +110,6 @@ jobs:
             - Do NOT check build signal or attempt to build/test the code
             - Ignore pre-existing issues not introduced by this PR
             - Ignore issues a linter/compiler would catch (formatting, imports, types)
+            - Your ONLY available tools are: Read, Glob, Grep, Agent, and Bash with
+              gh/git commands. Do NOT attempt cat, cargo, python, curl, or any other
+              Bash commands — they will be denied and waste turns.

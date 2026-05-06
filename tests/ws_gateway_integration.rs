@@ -20,7 +20,8 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 use ironclaw::channels::IncomingMessage;
-use ironclaw::channels::web::server::{GatewayState, start_server};
+use ironclaw::channels::web::platform::router::start_server;
+use ironclaw::channels::web::platform::state::GatewayState;
 use ironclaw::channels::web::sse::SseManager;
 use ironclaw::channels::web::ws::WsConnectionTracker;
 use ironclaw_common::AppEvent;
@@ -42,30 +43,54 @@ async fn start_test_server() -> (
         sse: Arc::new(SseManager::new()),
         workspace: None,
         workspace_pool: None,
+        multi_tenant_mode: false,
         session_manager: None,
         log_broadcaster: None,
         log_level_handle: None,
         extension_manager: None,
         tool_registry: None,
         store: None,
+        settings_cache: None,
         job_manager: None,
         prompt_queue: None,
         scheduler: None,
         owner_id: "test-user".to_string(),
-        default_sender_id: "test-user".to_string(),
         shutdown_tx: tokio::sync::RwLock::new(None),
         ws_tracker: Some(Arc::new(WsConnectionTracker::new())),
         llm_provider: None,
+        llm_reload: None,
+        llm_session_manager: None,
+        config_toml_path: None,
         skill_registry: None,
         skill_catalog: None,
-        chat_rate_limiter: ironclaw::channels::web::server::PerUserRateLimiter::new(30, 60),
-        oauth_rate_limiter: ironclaw::channels::web::server::RateLimiter::new(10, 60),
-        webhook_rate_limiter: ironclaw::channels::web::server::RateLimiter::new(10, 60),
+        auth_manager: None,
+        chat_rate_limiter: ironclaw::channels::web::platform::state::PerUserRateLimiter::new(
+            30, 60,
+        ),
+        oauth_rate_limiter: ironclaw::channels::web::platform::state::PerUserRateLimiter::new(
+            20, 60,
+        ),
+        webhook_rate_limiter: ironclaw::channels::web::platform::state::RateLimiter::new(10, 60),
         registry_entries: Vec::new(),
         cost_guard: None,
         routine_engine: Arc::new(tokio::sync::RwLock::new(None)),
         startup_time: std::time::Instant::now(),
-        active_config: ironclaw::channels::web::server::ActiveConfigSnapshot::default(),
+        active_config: Arc::new(tokio::sync::RwLock::new(
+            ironclaw::channels::web::platform::state::ActiveConfigSnapshot::default(),
+        )),
+        secrets_store: None,
+        db_auth: None,
+        pairing_store: None,
+        oauth_providers: None,
+        oauth_state_store: None,
+        oauth_base_url: None,
+        oauth_allowed_domains: Vec::new(),
+        near_nonce_store: None,
+        near_rpc_url: None,
+        near_network: None,
+        oauth_sweep_shutdown: None,
+        frontend_html_cache: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
+        tool_dispatcher: None,
     });
 
     let auth = ironclaw::channels::web::auth::MultiAuthState::single(
@@ -73,7 +98,7 @@ async fn start_test_server() -> (
         "test-user".to_string(),
     );
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let bound_addr = start_server(addr, state.clone(), auth)
+    let bound_addr = start_server(addr, state.clone(), auth.into())
         .await
         .expect("Failed to start test server");
 
@@ -149,7 +174,7 @@ async fn test_ws_message_reaches_agent() {
         .expect("Agent channel closed");
 
     assert_eq!(incoming.content, "hello from ws");
-    assert_eq!(incoming.thread_id.as_deref(), Some("t42"));
+    assert_eq!(incoming.thread_id.as_ref().map(|t| t.as_str()), Some("t42"));
     assert_eq!(incoming.channel, "gateway");
     assert_eq!(incoming.user_id, "test-user");
 
@@ -289,6 +314,20 @@ async fn test_gateway_status_endpoint() {
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["ws_connections"], 1);
     assert!(body["total_connections"].as_u64().unwrap() >= 1);
+
+    // Regression for #2982: the response carries the engine flag under a
+    // single canonical name. The old duplicate `engine_v2` field led the
+    // gateway JS to read the value from one name while writing the other,
+    // and dropping it locks in the wire-contract rule from
+    // .claude/rules/types.md.
+    assert!(
+        body.get("engine_v2_enabled").is_some(),
+        "expected engine_v2_enabled field on gateway status response"
+    );
+    assert!(
+        body.get("engine_v2").is_none(),
+        "duplicate engine_v2 field must not be re-introduced (#2982)"
+    );
 }
 
 #[tokio::test]
@@ -317,6 +356,8 @@ async fn test_ws_multiple_events_in_sequence() {
     });
     state.sse.broadcast(AppEvent::ToolStarted {
         name: "shell".to_string(),
+        detail: None,
+        call_id: Some("call_shell_1".to_string()),
         thread_id: None,
     });
     state.sse.broadcast(AppEvent::ToolCompleted {
@@ -324,6 +365,8 @@ async fn test_ws_multiple_events_in_sequence() {
         success: true,
         error: None,
         parameters: None,
+        call_id: Some("call_shell_1".to_string()),
+        duration_ms: Some(42),
         thread_id: None,
     });
     state.sse.broadcast(AppEvent::Response {
@@ -344,7 +387,10 @@ async fn test_ws_multiple_events_in_sequence() {
 
     assert_eq!(p1["event_type"], "thinking");
     assert_eq!(p2["event_type"], "tool_started");
+    assert_eq!(p2["data"]["call_id"], "call_shell_1");
     assert_eq!(p3["event_type"], "tool_completed");
+    assert_eq!(p3["data"]["call_id"], "call_shell_1");
+    assert_eq!(p3["data"]["duration_ms"], 42);
     assert_eq!(p4["event_type"], "response");
 
     ws.close(None).await.unwrap();

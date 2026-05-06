@@ -23,6 +23,7 @@ wit_bindgen::generate!({
 });
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 // Re-export generated types
 use exports::near::agent::channel::{
@@ -115,6 +116,21 @@ struct SlackMessageMetadata {
     team_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Eq, Hash, PartialEq, Serialize, Deserialize)]
+struct ActiveSlackThreadKey {
+    team_id: Option<String>,
+    channel: String,
+    thread_ts: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ActiveSlackThread {
+    #[serde(flatten)]
+    key: ActiveSlackThreadKey,
+    #[serde(default)]
+    last_seen_ms: u64,
+}
+
 /// Slack API response for chat.postMessage.
 #[derive(Debug, Deserialize)]
 struct SlackPostMessageResponse {
@@ -129,8 +145,54 @@ const OWNER_ID_PATH: &str = "state/owner_id";
 const DM_POLICY_PATH: &str = "state/dm_policy";
 /// Workspace path for persisting allow_from (JSON array) across WASM callbacks.
 const ALLOW_FROM_PATH: &str = "state/allow_from";
+/// Workspace path for thread timestamps the bot has already joined.
+const ACTIVE_THREADS_PATH: &str = "state/active_threads";
+/// Threads expire after 24h of inactivity so the participation cache stays bounded.
+const ACTIVE_THREAD_TTL_MS: u64 = 24 * 60 * 60 * 1000;
+/// Hard cap on remembered threads per workspace.
+const ACTIVE_THREAD_MAX_ENTRIES: usize = 256;
 /// Channel name for pairing store (used by pairing host APIs).
 const CHANNEL_NAME: &str = "slack";
+
+#[cfg(not(test))]
+fn host_workspace_read(path: &str) -> Option<String> {
+    channel_host::workspace_read(path)
+}
+
+#[cfg(test)]
+fn host_workspace_read(path: &str) -> Option<String> {
+    test_host::workspace_read(path)
+}
+
+#[cfg(not(test))]
+fn host_workspace_write(path: &str, content: &str) -> Result<(), String> {
+    channel_host::workspace_write(path, content)
+}
+
+#[cfg(test)]
+fn host_workspace_write(path: &str, content: &str) -> Result<(), String> {
+    test_host::workspace_write(path, content)
+}
+
+#[cfg(not(test))]
+fn host_emit_message(message: &EmittedMessage) {
+    channel_host::emit_message(message);
+}
+
+#[cfg(test)]
+fn host_emit_message(message: &EmittedMessage) {
+    test_host::emit_message(message);
+}
+
+#[cfg(not(test))]
+fn host_now_millis() -> u64 {
+    channel_host::now_millis()
+}
+
+#[cfg(test)]
+fn host_now_millis() -> u64 {
+    test_host::now_millis()
+}
 
 /// Channel configuration from capabilities file.
 #[derive(Debug, Deserialize)]
@@ -165,22 +227,22 @@ impl Guest for SlackChannel {
 
         // Persist owner_id so subsequent callbacks can read it
         if let Some(ref owner_id) = config.owner_id {
-            let _ = channel_host::workspace_write(OWNER_ID_PATH, owner_id);
+            let _ = host_workspace_write(OWNER_ID_PATH, owner_id);
             channel_host::log(
                 channel_host::LogLevel::Info,
                 &format!("Owner restriction enabled: user {}", owner_id),
             );
         } else {
-            let _ = channel_host::workspace_write(OWNER_ID_PATH, "");
+            let _ = host_workspace_write(OWNER_ID_PATH, "");
         }
 
         // Persist dm_policy and allow_from for DM pairing
         let dm_policy = config.dm_policy.as_deref().unwrap_or("pairing");
-        let _ = channel_host::workspace_write(DM_POLICY_PATH, dm_policy);
+        let _ = host_workspace_write(DM_POLICY_PATH, dm_policy);
 
         let allow_from_json = serde_json::to_string(&config.allow_from.unwrap_or_default())
             .unwrap_or_else(|_| "[]".to_string());
-        let _ = channel_host::workspace_write(ALLOW_FROM_PATH, &allow_from_json);
+        let _ = host_workspace_write(ALLOW_FROM_PATH, &allow_from_json);
 
         Ok(ChannelConfig {
             display_name: "Slack".to_string(),
@@ -253,80 +315,86 @@ impl Guest for SlackChannel {
     }
 
     fn on_respond(response: AgentResponse) -> Result<(), String> {
-        // Parse metadata to get channel info
         let metadata: SlackMessageMetadata = serde_json::from_str(&response.metadata_json)
             .map_err(|e| format!("Failed to parse metadata: {}", e))?;
 
-        // Build Slack API request
-        let mut payload = serde_json::json!({
-            "channel": metadata.channel,
-            "text": response.content,
-        });
+        let thread_ts = response.thread_id.clone().or(metadata.thread_ts.clone());
+        let ts = post_slack_message(
+            &metadata.channel,
+            &response.content,
+            thread_ts.as_deref(),
+        )?;
 
-        // Add thread_ts for threaded replies
-        if let Some(thread_ts) = response.thread_id.or(metadata.thread_ts) {
-            payload["thread_ts"] = serde_json::Value::String(thread_ts);
+        if let Some(thread_ts) = thread_ts {
+            if let Err(e) = remember_active_slack_thread(
+                metadata.team_id.as_deref(),
+                &metadata.channel,
+                &thread_ts,
+            ) {
+                channel_host::log(
+                    channel_host::LogLevel::Warn,
+                    &format!("Failed to track active thread: {}", e),
+                );
+            }
         }
 
-        let payload_bytes = serde_json::to_vec(&payload)
-            .map_err(|e| format!("Failed to serialize payload: {}", e))?;
-
-        // Make HTTP request to Slack API
-        // The bot token is injected by the host based on credential configuration
-        let headers = serde_json::json!({
-            "Content-Type": "application/json"
-        });
-
-        let result = channel_host::http_request(
-            "POST",
-            "https://slack.com/api/chat.postMessage",
-            &headers.to_string(),
-            Some(&payload_bytes),
-            None,
+        channel_host::log(
+            channel_host::LogLevel::Debug,
+            &format!(
+                "Posted message to Slack channel {}: ts={}",
+                metadata.channel,
+                ts.unwrap_or_default()
+            ),
         );
 
-        match result {
-            Ok(http_response) => {
-                if http_response.status != 200 {
-                    return Err(format!(
-                        "Slack API returned status {}",
-                        http_response.status
-                    ));
-                }
-
-                // Parse Slack response
-                let slack_response: SlackPostMessageResponse =
-                    serde_json::from_slice(&http_response.body)
-                        .map_err(|e| format!("Failed to parse Slack response: {}", e))?;
-
-                if !slack_response.ok {
-                    return Err(format!(
-                        "Slack API error: {}",
-                        slack_response
-                            .error
-                            .unwrap_or_else(|| "unknown".to_string())
-                    ));
-                }
-
-                channel_host::log(
-                    channel_host::LogLevel::Debug,
-                    &format!(
-                        "Posted message to Slack channel {}: ts={}",
-                        metadata.channel,
-                        slack_response.ts.unwrap_or_default()
-                    ),
-                );
-
-                Ok(())
-            }
-            Err(e) => Err(format!("HTTP request failed: {}", e)),
-        }
+        Ok(())
     }
 
     fn on_status(_update: StatusUpdate) {}
 
-    fn on_broadcast(_user_id: String, _response: AgentResponse) -> Result<(), String> {
-        Err("broadcast not yet implemented for Slack channel".to_string())
+    fn on_broadcast(user_id: String, response: AgentResponse) -> Result<(), String> {
+        let target = resolve_broadcast_target(&user_id);
+        if target.is_empty() {
+            return Err(
+                "broadcast failed: no target specified. Pass a Slack channel ID (C0...) \
+                 or user ID (U0...) as the target."
+                    .to_string(),
+            );
+        }
+
+        if !looks_like_slack_id(target) {
+            return Err(format!(
+                "Broadcast target '{}' is not a valid Slack ID (expected C/U/D/G/W prefix). \
+                 Use a channel ID (C0...) or user ID (U0...), not a channel name.",
+                target
+            ));
+        }
+
+        let ts = post_slack_message(target, &response.content, response.thread_id.as_deref())?;
+
+        // Track the thread so replies to this broadcast are recognized as
+        // active threads. Use the explicit thread_id if provided, otherwise
+        // fall back to the message timestamp returned by Slack (which becomes
+        // the thread root if someone replies to this message).
+        if let Some(thread_ts) = response.thread_id.as_deref().or(ts.as_deref()) {
+            if let Err(e) = track_active_thread(target, thread_ts) {
+                channel_host::log(
+                    channel_host::LogLevel::Warn,
+                    &format!("Failed to track active thread: {}", e),
+                );
+            }
+        }
+
+        channel_host::log(
+            channel_host::LogLevel::Debug,
+            &format!(
+                "Broadcast message to Slack target {}: ts={}",
+                target,
+                ts.unwrap_or_default()
+            ),
+        );
+
+        Ok(())
     }
 
     fn on_shutdown() {
@@ -452,13 +520,14 @@ fn download_and_store_slack_files(attachments: &[InboundAttachment]) {
     }
 }
 
+fn prepare_inbound_attachments(files: &Option<Vec<SlackFile>>) -> Vec<InboundAttachment> {
+    let attachments = extract_slack_attachments(files);
+    download_and_store_slack_files(&attachments);
+    attachments
+}
+
 /// Handle a Slack event and emit message if applicable.
 fn handle_slack_event(event: SlackEvent, team_id: Option<String>, _event_id: Option<String>) {
-    let attachments = extract_slack_attachments(&event.files);
-
-    // Download and store file attachments for host-side processing
-    download_and_store_slack_files(&attachments);
-
     match event.event_type.as_str() {
         // Direct mention of the bot (always in a channel, not a DM)
         "app_mention" => {
@@ -472,6 +541,7 @@ fn handle_slack_event(event: SlackEvent, team_id: Option<String>, _event_id: Opt
                 if !check_sender_permission(&user, &channel, false) {
                     return;
                 }
+                let attachments = prepare_inbound_attachments(&event.files);
                 emit_message(
                     user,
                     text,
@@ -483,7 +553,7 @@ fn handle_slack_event(event: SlackEvent, team_id: Option<String>, _event_id: Opt
             }
         }
 
-        // Direct message to the bot
+        // Direct message or thread follow-up to the bot
         "message" => {
             // Skip messages from bots (including ourselves)
             if event.bot_id.is_some() || event.subtype.is_some() {
@@ -496,11 +566,21 @@ fn handle_slack_event(event: SlackEvent, team_id: Option<String>, _event_id: Opt
                 event.text,
                 event.ts.clone(),
             ) {
-                // Only process DMs (channel IDs starting with D)
-                if channel.starts_with('D') {
-                    if !check_sender_permission(&user, &channel, true) {
+                let is_dm = channel.starts_with('D');
+                let is_active_thread = event.thread_ts.as_deref().is_some_and(|thread_ts| {
+                    is_active_slack_thread(team_id.as_deref(), &channel, thread_ts)
+                });
+
+                // DMs are always processed. For channel threads, once the bot
+                // has already replied in a thread we intentionally allow
+                // follow-ups from that thread without re-running DM pairing or
+                // allow_from checks. This matches Slack's app_mention behavior:
+                // the thread stays as visible as the surrounding channel.
+                if is_dm || is_active_thread {
+                    if !check_sender_permission(&user, &channel, is_dm) {
                         return;
                     }
+                    let attachments = prepare_inbound_attachments(&event.files);
                     emit_message(
                         user,
                         text,
@@ -551,7 +631,7 @@ fn emit_message(
     // Strip @ mentions of the bot from the text for cleaner messages
     let cleaned_text = strip_bot_mention(&text);
 
-    channel_host::emit_message(&EmittedMessage {
+    host_emit_message(&EmittedMessage {
         user_id,
         user_name: None, // Could fetch from Slack API if needed
         content: cleaned_text,
@@ -559,6 +639,207 @@ fn emit_message(
         metadata_json,
         attachments,
     });
+}
+
+fn active_slack_thread_key(
+    team_id: Option<&str>,
+    channel: &str,
+    thread_ts: &str,
+) -> ActiveSlackThreadKey {
+    ActiveSlackThreadKey {
+        team_id: team_id.map(str::to_string),
+        channel: channel.to_string(),
+        thread_ts: thread_ts.to_string(),
+    }
+}
+
+fn active_slack_thread_entry(
+    team_id: Option<&str>,
+    channel: &str,
+    thread_ts: &str,
+    last_seen_ms: u64,
+) -> ActiveSlackThread {
+    ActiveSlackThread {
+        key: active_slack_thread_key(team_id, channel, thread_ts),
+        last_seen_ms,
+    }
+}
+
+fn parse_active_slack_threads(
+    raw: Option<&str>,
+    now_ms: u64,
+) -> HashMap<ActiveSlackThreadKey, u64> {
+    raw.and_then(|value| serde_json::from_str::<Vec<ActiveSlackThread>>(value).ok())
+        .map(|threads| {
+            threads
+                .into_iter()
+                .map(|thread| {
+                    (
+                        thread.key,
+                        if thread.last_seen_ms == 0 {
+                            now_ms
+                        } else {
+                            thread.last_seen_ms
+                        },
+                    )
+                })
+                .collect()
+        })
+        .or_else(|| {
+            raw.and_then(|value| serde_json::from_str::<Vec<String>>(value).ok())
+                .map(|legacy| {
+                    legacy
+                        .into_iter()
+                        .map(|thread_ts| (active_slack_thread_key(None, "", &thread_ts), now_ms))
+                        .collect()
+                })
+        })
+        .unwrap_or_default()
+}
+
+fn serialize_active_slack_threads(threads: &HashMap<ActiveSlackThreadKey, u64>) -> String {
+    let mut sorted: Vec<_> = threads
+        .iter()
+        .map(|(key, last_seen_ms)| {
+            active_slack_thread_entry(
+                key.team_id.as_deref(),
+                &key.channel,
+                &key.thread_ts,
+                *last_seen_ms,
+            )
+        })
+        .collect();
+    sorted.sort_unstable_by(|left, right| {
+        left.key
+            .team_id
+            .cmp(&right.key.team_id)
+            .then(left.key.channel.cmp(&right.key.channel))
+            .then(left.key.thread_ts.cmp(&right.key.thread_ts))
+    });
+    serde_json::to_string(&sorted).unwrap_or_else(|_| "[]".to_string())
+}
+
+fn prune_active_slack_threads(threads: &mut HashMap<ActiveSlackThreadKey, u64>, now_ms: u64) {
+    let cutoff = now_ms.saturating_sub(ACTIVE_THREAD_TTL_MS);
+    threads.retain(|_, last_seen_ms| *last_seen_ms >= cutoff);
+
+    if threads.len() <= ACTIVE_THREAD_MAX_ENTRIES {
+        return;
+    }
+
+    let mut entries: Vec<_> = threads
+        .iter()
+        .map(|(key, last_seen_ms)| (key.clone(), *last_seen_ms))
+        .collect();
+    entries.sort_unstable_by(|left, right| {
+        right
+            .1
+            .cmp(&left.1)
+            .then(left.0.team_id.cmp(&right.0.team_id))
+            .then(left.0.channel.cmp(&right.0.channel))
+            .then(left.0.thread_ts.cmp(&right.0.thread_ts))
+    });
+    entries.truncate(ACTIVE_THREAD_MAX_ENTRIES);
+    *threads = entries.into_iter().collect();
+}
+
+fn load_active_slack_threads_from_workspace() -> HashMap<ActiveSlackThreadKey, u64> {
+    let raw = host_workspace_read(ACTIVE_THREADS_PATH);
+    let now_ms = host_now_millis();
+    let mut threads = parse_active_slack_threads(raw.as_deref(), now_ms);
+    prune_active_slack_threads(&mut threads, now_ms);
+
+    let serialized = serialize_active_slack_threads(&threads);
+    let should_persist = raw.as_deref().is_some_and(|existing| existing != serialized)
+        || (raw.is_none() && !threads.is_empty());
+    if should_persist {
+        let _ = host_workspace_write(ACTIVE_THREADS_PATH, &serialized);
+    }
+
+    threads
+}
+
+fn active_slack_thread_is_known(
+    raw: Option<&str>,
+    team_id: Option<&str>,
+    channel: &str,
+    thread_ts: &str,
+    now_ms: u64,
+) -> bool {
+    let mut threads = parse_active_slack_threads(raw, now_ms);
+    prune_active_slack_threads(&mut threads, now_ms);
+    threads.contains_key(&active_slack_thread_key(team_id, channel, thread_ts))
+        || threads.contains_key(&active_slack_thread_key(None, channel, thread_ts))
+        || threads.contains_key(&active_slack_thread_key(None, "", thread_ts))
+}
+
+fn is_active_slack_thread(team_id: Option<&str>, channel: &str, thread_ts: &str) -> bool {
+    let threads = load_active_slack_threads_from_workspace();
+    threads.contains_key(&active_slack_thread_key(team_id, channel, thread_ts))
+        || threads.contains_key(&active_slack_thread_key(None, channel, thread_ts))
+        || threads.contains_key(&active_slack_thread_key(None, "", thread_ts))
+}
+
+fn track_active_thread(channel: &str, thread_ts: &str) -> Result<(), String> {
+    remember_active_slack_thread(None, channel, thread_ts)
+}
+
+fn remember_active_slack_thread(
+    team_id: Option<&str>,
+    channel: &str,
+    thread_ts: &str,
+) -> Result<(), String> {
+    if channel.starts_with('D') {
+        return Ok(());
+    }
+
+    let now_ms = host_now_millis();
+    let mut threads = load_active_slack_threads_from_workspace();
+    let key = active_slack_thread_key(team_id, channel, thread_ts);
+    threads.insert(key, now_ms);
+    threads.remove(&active_slack_thread_key(None, "", thread_ts));
+    prune_active_slack_threads(&mut threads, now_ms);
+
+    host_workspace_write(ACTIVE_THREADS_PATH, &serialize_active_slack_threads(&threads))
+}
+
+type ActiveThreads = HashMap<String, u64>;
+
+fn active_thread_key(channel: &str, thread_ts: &str) -> String {
+    format!("{channel}/{thread_ts}")
+}
+
+fn is_thread_marker_fresh(last_seen_millis: u64, now_millis: u64) -> bool {
+    now_millis.saturating_sub(last_seen_millis) <= ACTIVE_THREAD_TTL_MS
+}
+
+fn prune_active_threads(active_threads: &mut ActiveThreads, now_millis: u64) -> bool {
+    let mut changed = false;
+    active_threads.retain(|_, last_seen_millis| {
+        let keep = is_thread_marker_fresh(*last_seen_millis, now_millis);
+        if !keep {
+            changed = true;
+        }
+        keep
+    });
+
+    if active_threads.len() > ACTIVE_THREAD_MAX_ENTRIES {
+        let mut oldest_first: Vec<_> = active_threads
+            .iter()
+            .map(|(key, last_seen_millis)| (key.clone(), *last_seen_millis))
+            .collect();
+        oldest_first.sort_by_key(|(_, last_seen_millis)| *last_seen_millis);
+
+        for (key, _) in oldest_first
+            .into_iter()
+            .take(active_threads.len() - ACTIVE_THREAD_MAX_ENTRIES)
+        {
+            active_threads.remove(&key);
+            changed = true;
+        }
+    }
+
+    changed
 }
 
 // ============================================================================
@@ -569,7 +850,7 @@ fn emit_message(
 /// For pairing mode, sends a pairing code DM if denied.
 fn check_sender_permission(user_id: &str, channel_id: &str, is_dm: bool) -> bool {
     // 1. Owner check (highest priority, applies to all contexts)
-    let owner_id = channel_host::workspace_read(OWNER_ID_PATH).filter(|s| !s.is_empty());
+    let owner_id = host_workspace_read(OWNER_ID_PATH).filter(|s| !s.is_empty());
     if let Some(ref owner) = owner_id {
         if user_id != owner {
             channel_host::log(
@@ -589,15 +870,14 @@ fn check_sender_permission(user_id: &str, channel_id: &str, is_dm: bool) -> bool
         return true; // Channel messages bypass DM policy
     }
 
-    let dm_policy =
-        channel_host::workspace_read(DM_POLICY_PATH).unwrap_or_else(|| "pairing".to_string());
+    let dm_policy = host_workspace_read(DM_POLICY_PATH).unwrap_or_else(|| "pairing".to_string());
 
     if dm_policy == "open" {
         return true;
     }
 
     // 3. Build merged allow list: config allow_from + pairing store
-    let mut allowed: Vec<String> = channel_host::workspace_read(ALLOW_FROM_PATH)
+    let mut allowed: Vec<String> = host_workspace_read(ALLOW_FROM_PATH)
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
 
@@ -606,8 +886,7 @@ fn check_sender_permission(user_id: &str, channel_id: &str, is_dm: bool) -> bool
     }
 
     // 4. Check sender (Slack events only have user ID, not username)
-    let is_allowed =
-        allowed.contains(&"*".to_string()) || allowed.contains(&user_id.to_string());
+    let is_allowed = allowed.contains(&"*".to_string()) || allowed.contains(&user_id.to_string());
 
     if is_allowed {
         return true;
@@ -625,13 +904,20 @@ fn check_sender_permission(user_id: &str, channel_id: &str, is_dm: bool) -> bool
             Ok(result) => {
                 channel_host::log(
                     channel_host::LogLevel::Info,
-                    &format!(
-                        "Pairing request for user {}: code {}",
-                        user_id, result.code
-                    ),
+                    &format!("Pairing request for user {}: code {}", user_id, result.code),
                 );
-                if result.created {
-                    let _ = send_pairing_reply(channel_id, &result.code);
+                // Surface Slack-side send failures rather than swallowing them —
+                // #1839 (pairing dead-ends) reported users seeing "Awaiting
+                // Pairing" forever because `chat.postMessage` failed silently
+                // (e.g., missing `chat:write` scope, revoked bot token).
+                if let Err(e) = send_pairing_reply(channel_id, &result.code) {
+                    channel_host::log(
+                        channel_host::LogLevel::Error,
+                        &format!(
+                            "Slack pairing reply failed for user {}: {}. Verify the bot has `chat:write` and `im:write` scopes and that the bot token is still valid.",
+                            user_id, e
+                        ),
+                    );
                 }
             }
             Err(e) => {
@@ -650,8 +936,8 @@ fn send_pairing_reply(channel_id: &str, code: &str) -> Result<(), String> {
     let payload = serde_json::json!({
         "channel": channel_id,
         "text": format!(
-            "To pair with this bot, run: `ironclaw pairing approve slack {}`",
-            code
+            "Enter this code in IronClaw to pair your slack account: `{}`. CLI fallback: `ironclaw pairing approve slack {}`",
+            code, code
         ),
     });
 
@@ -669,7 +955,14 @@ fn send_pairing_reply(channel_id: &str, code: &str) -> Result<(), String> {
     );
 
     match result {
-        Ok(response) if response.status == 200 => Ok(()),
+        Ok(response) if response.status == 200 => {
+            // Slack's `chat.postMessage` returns HTTP 200 even on permission /
+            // scope / token failures — the actual error lives in the response
+            // body as `{"ok": false, "error": "<code>"}`. Treating HTTP 200 as
+            // success unconditionally was the root cause of pairing-reply
+            // failures being invisible (#1839).
+            slack_post_message_result(&response.body)
+        }
         Ok(response) => {
             let body_str = String::from_utf8_lossy(&response.body);
             Err(format!(
@@ -679,6 +972,118 @@ fn send_pairing_reply(channel_id: &str, code: &str) -> Result<(), String> {
         }
         Err(e) => Err(format!("HTTP request failed: {}", e)),
     }
+}
+
+/// Interpret a Slack `chat.postMessage` response body (returned with HTTP 200)
+/// as either success or a scoped failure. Extracted so the parsing logic can
+/// be unit-tested without the `channel_host` extern — see #1839.
+fn slack_post_message_result(body: &[u8]) -> Result<(), String> {
+    let body_str = String::from_utf8_lossy(body);
+    let parsed: Option<serde_json::Value> = serde_json::from_slice(body).ok();
+    let ok = parsed
+        .as_ref()
+        .and_then(|v| v.get("ok").and_then(|b| b.as_bool()))
+        .unwrap_or(false);
+    if ok {
+        Ok(())
+    } else {
+        let error_code = parsed
+            .as_ref()
+            .and_then(|v| v.get("error").and_then(|e| e.as_str()))
+            .unwrap_or("unknown_error");
+        Err(format!(
+            "Slack rejected chat.postMessage ({error_code}): {body_str}"
+        ))
+    }
+}
+
+/// Post a message via Slack `chat.postMessage` and return the message timestamp.
+///
+/// The bot token is injected by the host credential system — this function
+/// only sets `Content-Type`. Used by both `on_respond` and `on_broadcast`.
+fn post_slack_message(
+    channel: &str,
+    text: &str,
+    thread_ts: Option<&str>,
+) -> Result<Option<String>, String> {
+    let payload = build_broadcast_payload(channel, text, thread_ts);
+    let payload_bytes = serde_json::to_vec(&payload)
+        .map_err(|e| format!("Failed to serialize payload: {}", e))?;
+
+    let headers = serde_json::json!({
+        "Content-Type": "application/json"
+    });
+
+    let result = channel_host::http_request(
+        "POST",
+        "https://slack.com/api/chat.postMessage",
+        &headers.to_string(),
+        Some(&payload_bytes),
+        None,
+    );
+
+    match result {
+        Ok(http_response) => {
+            if http_response.status != 200 {
+                return Err(format!(
+                    "Slack API returned status {}",
+                    http_response.status
+                ));
+            }
+
+            let slack_response: SlackPostMessageResponse =
+                serde_json::from_slice(&http_response.body)
+                    .map_err(|e| format!("Failed to parse Slack response: {}", e))?;
+
+            if !slack_response.ok {
+                return Err(format!(
+                    "Slack API error: {}",
+                    slack_response
+                        .error
+                        .unwrap_or_else(|| "unknown".to_string())
+                ));
+            }
+
+            Ok(slack_response.ts)
+        }
+        Err(e) => Err(format!("HTTP request failed: {}", e)),
+    }
+}
+
+/// Normalize a broadcast target by stripping a leading `#` if present.
+///
+/// The message tool passes the target as `user_id` (e.g. `#C0123ABC`,
+/// `C0123ABC`, or `U0123ABC`). The Slack API expects a channel ID (C0...)
+/// or user ID (U0...), not a channel name.
+fn resolve_broadcast_target(raw: &str) -> &str {
+    raw.strip_prefix('#').unwrap_or(raw)
+}
+
+/// Check if a string looks like a Slack ID (starts with C, U, D, G, or W followed by alphanumeric).
+fn looks_like_slack_id(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some('C' | 'U' | 'D' | 'G' | 'W') => {
+            chars.next().is_some_and(|c| c.is_ascii_alphanumeric())
+        }
+        _ => false,
+    }
+}
+
+/// Build the JSON payload for a Slack `chat.postMessage` broadcast.
+fn build_broadcast_payload(
+    target: &str,
+    content: &str,
+    thread_ts: Option<&str>,
+) -> serde_json::Value {
+    let mut payload = serde_json::json!({
+        "channel": target,
+        "text": content,
+    });
+    if let Some(ts) = thread_ts {
+        payload["thread_ts"] = serde_json::Value::String(ts.to_string());
+    }
+    payload
 }
 
 /// Strip leading bot mention from text.
@@ -715,8 +1120,124 @@ fn json_response(status: u16, value: serde_json::Value) -> OutgoingHttpResponse 
 export!(SlackChannel);
 
 #[cfg(test)]
+mod test_host {
+    use super::*;
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct RecordedMessage {
+        pub user_id: String,
+        pub content: String,
+        pub thread_id: Option<String>,
+        pub metadata_json: String,
+    }
+
+    #[derive(Default)]
+    struct TestHostState {
+        workspace: HashMap<String, String>,
+        emitted_messages: Vec<RecordedMessage>,
+        now_millis: u64,
+    }
+
+    std::thread_local! {
+        static STATE: RefCell<TestHostState> = RefCell::new(TestHostState::default());
+    }
+
+    pub fn reset() {
+        STATE.with(|state| *state.borrow_mut() = TestHostState::default());
+    }
+
+    pub fn set_now_millis(now_millis: u64) {
+        STATE.with(|state| state.borrow_mut().now_millis = now_millis);
+    }
+
+    pub fn now_millis() -> u64 {
+        STATE.with(|state| state.borrow().now_millis)
+    }
+
+    pub fn workspace_read(path: &str) -> Option<String> {
+        STATE.with(|state| state.borrow().workspace.get(path).cloned())
+    }
+
+    pub fn workspace_write(path: &str, content: &str) -> Result<(), String> {
+        STATE.with(|state| {
+            state
+                .borrow_mut()
+                .workspace
+                .insert(path.to_string(), content.to_string());
+        });
+        Ok(())
+    }
+
+    pub fn set_workspace(path: &str, content: &str) {
+        let _ = workspace_write(path, content);
+    }
+
+    pub fn emit_message(message: &EmittedMessage) {
+        STATE.with(|state| {
+            state.borrow_mut().emitted_messages.push(RecordedMessage {
+                user_id: message.user_id.clone(),
+                content: message.content.clone(),
+                thread_id: message.thread_id.clone(),
+                metadata_json: message.metadata_json.clone(),
+            });
+        });
+    }
+
+    pub fn take_emitted_messages() -> Vec<RecordedMessage> {
+        STATE.with(|state| std::mem::take(&mut state.borrow_mut().emitted_messages))
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample_thread_message_event(thread_ts: &str) -> SlackEvent {
+        SlackEvent {
+            event_type: "message".to_string(),
+            user: Some("U123".to_string()),
+            channel: Some("C123".to_string()),
+            text: Some("follow up".to_string()),
+            thread_ts: Some(thread_ts.to_string()),
+            ts: Some("1710000000.000002".to_string()),
+            bot_id: None,
+            subtype: None,
+            files: None,
+        }
+    }
+
+    // Regression for #1839 — pairing dead-ends were in part caused by
+    // `send_pairing_reply` treating HTTP 200 as success even when Slack's
+    // `chat.postMessage` body contained `{"ok": false}`. The failures were
+    // swallowed, the user saw no pairing code, and "Awaiting Pairing" stuck
+    // in the UI indefinitely.
+    #[test]
+    fn slack_post_message_result_accepts_ok_true() {
+        let body = br#"{"ok":true,"channel":"D123","ts":"1710000000.000100"}"#;
+        assert!(super::slack_post_message_result(body).is_ok());
+    }
+
+    #[test]
+    fn slack_post_message_result_rejects_ok_false_with_error_code() {
+        let body = br#"{"ok":false,"error":"missing_scope","needed":"chat:write"}"#;
+        let err = super::slack_post_message_result(body).expect_err("ok=false must be an error");
+        assert!(
+            err.contains("missing_scope"),
+            "error must carry the Slack error code, got: {err}"
+        );
+    }
+
+    #[test]
+    fn slack_post_message_result_rejects_empty_or_invalid_body() {
+        let err = super::slack_post_message_result(b"").expect_err("empty body must fail");
+        assert!(err.contains("unknown_error"));
+
+        let err = super::slack_post_message_result(b"not json at all")
+            .expect_err("non-JSON body must fail");
+        assert!(err.contains("unknown_error"));
+    }
 
     #[test]
     fn test_extract_slack_attachments_with_files() {
@@ -823,7 +1344,257 @@ mod tests {
 
     #[test]
     fn test_max_download_size_constant() {
-        // Verify the constant is 20 MB
         assert_eq!(MAX_DOWNLOAD_SIZE_BYTES, 20 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_active_slack_threads_round_trip() {
+        let now_ms = 1_710_000_000_000_u64;
+        let raw = format!(
+            r#"[{{"team_id":null,"channel":"G2","thread_ts":"678.90","last_seen_ms":{now_ms}}},{{"team_id":"T1","channel":"C1","thread_ts":"123.45","last_seen_ms":{now_ms}}}]"#
+        );
+        let threads = parse_active_slack_threads(Some(&raw), now_ms);
+        assert_eq!(
+            threads.get(&active_slack_thread_key(Some("T1"), "C1", "123.45")),
+            Some(&now_ms)
+        );
+        assert_eq!(
+            threads.get(&active_slack_thread_key(None, "G2", "678.90")),
+            Some(&now_ms)
+        );
+        assert!(active_slack_thread_is_known(
+            Some(&raw),
+            Some("T1"),
+            "C1",
+            "123.45",
+            now_ms,
+        ));
+        assert!(!active_slack_thread_is_known(
+            Some(&raw),
+            Some("T1"),
+            "C2",
+            "123.45",
+            now_ms,
+        ));
+        assert_eq!(serialize_active_slack_threads(&threads), raw);
+    }
+
+    #[test]
+    fn test_active_slack_threads_accept_legacy_timestamps() {
+        let now_ms = 1_710_000_000_000_u64;
+        let raw = r#"["123.45","678.90"]"#;
+        let threads = parse_active_slack_threads(Some(raw), now_ms);
+        assert_eq!(
+            threads.get(&active_slack_thread_key(None, "", "123.45")),
+            Some(&now_ms)
+        );
+        assert!(active_slack_thread_is_known(
+            Some(raw),
+            Some("T1"),
+            "C1",
+            "123.45",
+            now_ms,
+        ));
+        assert!(!active_slack_thread_is_known(
+            Some(raw),
+            Some("T1"),
+            "C1",
+            "999.99",
+            now_ms,
+        ));
+    }
+
+    #[test]
+    fn test_active_slack_threads_prune_expired_and_cap_entries() {
+        let now_ms = ACTIVE_THREAD_TTL_MS + 10_000;
+        let mut threads = HashMap::new();
+        threads.insert(active_slack_thread_key(Some("T1"), "C1", "expired"), 1);
+        for idx in 0..(ACTIVE_THREAD_MAX_ENTRIES + 10) {
+            threads.insert(
+                active_slack_thread_key(Some("T1"), "C1", &format!("live-{idx}")),
+                now_ms.saturating_add(idx as u64),
+            );
+        }
+
+        prune_active_slack_threads(&mut threads, now_ms);
+        assert_eq!(threads.len(), ACTIVE_THREAD_MAX_ENTRIES);
+        assert!(!threads.contains_key(&active_slack_thread_key(Some("T1"), "C1", "expired")));
+        assert!(!threads.contains_key(&active_slack_thread_key(Some("T1"), "C1", "live-0")));
+    }
+
+    #[test]
+    fn test_active_slack_threads_ignore_invalid_json() {
+        assert!(parse_active_slack_threads(Some("not-json"), 123).is_empty());
+        assert!(parse_active_slack_threads(None, 123).is_empty());
+    }
+
+    #[test]
+    fn test_handle_slack_event_emits_for_known_active_thread() {
+        test_host::reset();
+        test_host::set_now_millis(1_710_000_000_000_u64);
+
+        let threads = HashMap::from([(
+            active_slack_thread_key(Some("T1"), "C123", "1710000000.000001"),
+            1_710_000_000_000_u64,
+        )]);
+        test_host::set_workspace(ACTIVE_THREADS_PATH, &serialize_active_slack_threads(&threads));
+
+        handle_slack_event(
+            sample_thread_message_event("1710000000.000001"),
+            Some("T1".to_string()),
+            None,
+        );
+
+        let emitted = test_host::take_emitted_messages();
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(emitted[0].user_id, "U123");
+        assert_eq!(emitted[0].content, "follow up");
+        assert_eq!(
+            emitted[0].thread_id.as_deref(),
+            Some("1710000000.000001")
+        );
+    }
+
+    #[test]
+    fn test_handle_slack_event_skips_unknown_active_thread() {
+        test_host::reset();
+        test_host::set_now_millis(1_710_000_000_000_u64);
+
+        handle_slack_event(
+            sample_thread_message_event("1710000000.000001"),
+            Some("T1".to_string()),
+            None,
+        );
+
+        assert!(test_host::take_emitted_messages().is_empty());
+    }
+
+    #[test]
+    fn test_active_thread_key_scopes_by_channel_and_thread() {
+        assert_eq!(
+            active_thread_key("C123", "1742486400.000100"),
+            "C123/1742486400.000100"
+        );
+    }
+
+    #[test]
+    fn test_prune_active_threads_removes_expired_entries() {
+        let now_millis = ACTIVE_THREAD_TTL_MS + 1_000;
+        let mut active_threads = ActiveThreads::from([
+            (
+                "C1/expired".to_string(),
+                now_millis - ACTIVE_THREAD_TTL_MS - 1,
+            ),
+            ("C1/fresh".to_string(), now_millis - ACTIVE_THREAD_TTL_MS),
+        ]);
+
+        let changed = prune_active_threads(&mut active_threads, now_millis);
+
+        assert!(changed);
+        assert!(!active_threads.contains_key("C1/expired"));
+        assert!(active_threads.contains_key("C1/fresh"));
+    }
+
+    #[test]
+    fn test_prune_active_threads_trims_oldest_entries_when_over_limit() {
+        let now_millis = ACTIVE_THREAD_TTL_MS + 1_000;
+        let mut active_threads = ActiveThreads::new();
+
+        for i in 0..=ACTIVE_THREAD_MAX_ENTRIES {
+            active_threads.insert(format!("C1/{i}"), now_millis + i as u64);
+        }
+
+        let changed = prune_active_threads(
+            &mut active_threads,
+            now_millis + ACTIVE_THREAD_MAX_ENTRIES as u64,
+        );
+
+        assert!(changed);
+        assert_eq!(active_threads.len(), ACTIVE_THREAD_MAX_ENTRIES);
+        assert!(!active_threads.contains_key("C1/0"));
+        assert!(active_threads.contains_key(&format!("C1/{ACTIVE_THREAD_MAX_ENTRIES}")));
+    }
+
+    #[test]
+    fn test_is_thread_marker_fresh_respects_ttl_boundary() {
+        let now_millis = ACTIVE_THREAD_TTL_MS + 1_000;
+        assert!(is_thread_marker_fresh(
+            now_millis - ACTIVE_THREAD_TTL_MS,
+            now_millis
+        ));
+        assert!(!is_thread_marker_fresh(
+            now_millis - ACTIVE_THREAD_TTL_MS - 1,
+            now_millis
+        ));
+    }
+
+    #[test]
+    fn test_resolve_broadcast_target_strips_hash() {
+        assert_eq!(resolve_broadcast_target("#general"), "general");
+        assert_eq!(resolve_broadcast_target("#staging-eli5"), "staging-eli5");
+    }
+
+    #[test]
+    fn test_resolve_broadcast_target_preserves_ids() {
+        assert_eq!(resolve_broadcast_target("C0123ABC"), "C0123ABC");
+        assert_eq!(resolve_broadcast_target("U0123ABC"), "U0123ABC");
+    }
+
+    #[test]
+    fn test_resolve_broadcast_target_empty_input() {
+        assert_eq!(resolve_broadcast_target(""), "");
+        assert_eq!(resolve_broadcast_target("#"), "");
+    }
+
+    #[test]
+    fn test_build_broadcast_payload_without_thread() {
+        let payload = build_broadcast_payload("C0123", "hello world", None);
+        assert_eq!(payload["channel"], "C0123");
+        assert_eq!(payload["text"], "hello world");
+        assert!(payload.get("thread_ts").is_none());
+    }
+
+    #[test]
+    fn test_build_broadcast_payload_with_thread() {
+        let payload = build_broadcast_payload("C0123", "threaded reply", Some("1742486400.000100"));
+        assert_eq!(payload["channel"], "C0123");
+        assert_eq!(payload["text"], "threaded reply");
+        assert_eq!(payload["thread_ts"], "1742486400.000100");
+    }
+
+    #[test]
+    fn test_looks_like_slack_id_valid() {
+        assert!(looks_like_slack_id("C0123ABC"));
+        assert!(looks_like_slack_id("U0123ABC"));
+        assert!(looks_like_slack_id("D0123ABC"));
+        assert!(looks_like_slack_id("G0123ABC"));
+        assert!(looks_like_slack_id("W0123ABC"));
+    }
+
+    #[test]
+    fn test_looks_like_slack_id_invalid() {
+        assert!(!looks_like_slack_id("general"));
+        assert!(!looks_like_slack_id("staging-eli5"));
+        assert!(!looks_like_slack_id(""));
+        assert!(!looks_like_slack_id("C")); // too short, no second char
+        assert!(!looks_like_slack_id("c0123")); // lowercase
+    }
+
+    #[test]
+    fn test_resolve_broadcast_target_rejects_names_via_id_check() {
+        // After stripping '#', channel names fail the ID check
+        let target = resolve_broadcast_target("#general");
+        assert!(!looks_like_slack_id(target));
+
+        let target = resolve_broadcast_target("random-channel");
+        assert!(!looks_like_slack_id(target));
+    }
+
+    #[test]
+    fn test_resolve_broadcast_target_accepts_prefixed_ids() {
+        // IDs with '#' prefix are accepted after stripping
+        let target = resolve_broadcast_target("#C0123ABC");
+        assert!(looks_like_slack_id(target));
+        assert_eq!(target, "C0123ABC");
     }
 }

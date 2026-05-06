@@ -16,9 +16,12 @@ dependencies = [
 vision = [
     "anthropic>=0.40",
 ]
+telegram = [
+    "telethon>=1.40",
+]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "session"
 asyncio_default_test_loop_scope = "session"
-timeout = 120
+timeout = 360

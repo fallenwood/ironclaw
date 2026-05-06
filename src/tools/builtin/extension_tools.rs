@@ -1,15 +1,96 @@
 //! Agent-callable tools for managing extensions (MCP servers and WASM tools).
 //!
-//! These six tools let the LLM search, install, authenticate, activate, list,
-//! and remove extensions entirely through conversation.
+//! These built-ins manage extension discovery and lifecycle from conversation.
+//! In engine v2, the normal model-facing enablement path is
+//! `tool_activate(name=...)`: blocked integrations surface in capability
+//! background, and `tool_activate` internally handles install/auth/activation
+//! as needed. `tool_search`, `tool_list`, and `tool_info` support discovery;
+//! `tool_install` / `tool_auth` remain available as narrower runtime/compat
+//! surfaces rather than the primary v2 prompt contract.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 
 use crate::context::JobContext;
-use crate::extensions::{ExtensionKind, ExtensionManager};
-use crate::tools::tool::{ApprovalRequirement, Tool, ToolError, ToolOutput, require_str};
+use crate::extensions::{EnsureReadyIntent, EnsureReadyOutcome, ExtensionKind, ExtensionManager};
+use crate::tools::permissions::{
+    PermissionState, TOOL_PERMISSION_LOCKED_REASON, effective_permission,
+    seeded_default_permission, tool_permission_locked,
+};
+use crate::tools::registry::ToolRegistry;
+use crate::tools::tool::{
+    ApprovalRequirement, EngineCompatibility, Tool, ToolError, ToolOutput, require_str,
+};
+
+#[cfg(test)]
+fn activation_error_requires_auth(err: &str) -> bool {
+    let err_lower = err.to_ascii_lowercase();
+    err_lower.contains("authentication required")
+        || err_lower.contains("authentication")
+        || err_lower.contains("unauthorized")
+        || err_lower.contains("not authenticated")
+        || err.contains("401")
+}
+
+fn output_from_ensure_ready(outcome: EnsureReadyOutcome) -> serde_json::Value {
+    match outcome {
+        EnsureReadyOutcome::Ready {
+            name,
+            kind,
+            activation: Some(activation),
+            ..
+        } => serde_json::json!({
+            "status": "ready",
+            "name": name,
+            "kind": kind,
+            "tools_loaded": activation.tools_loaded,
+            "message": activation.message,
+        }),
+        EnsureReadyOutcome::Ready {
+            name,
+            kind,
+            phase,
+            activation: None,
+        } => serde_json::json!({
+            "status": "ready",
+            "name": name,
+            "kind": kind,
+            "phase": phase,
+            "message": format!("Extension '{}' is ready.", name),
+        }),
+        EnsureReadyOutcome::NeedsAuth {
+            auth,
+            credential_name,
+            ..
+        } => {
+            let mut value = serde_json::to_value(&auth)
+                .unwrap_or_else(|_| serde_json::json!({"error": "serialization failed"}));
+            if let Some(credential_name) = credential_name
+                && let Some(obj) = value.as_object_mut()
+            {
+                obj.insert(
+                    "credential_name".to_string(),
+                    serde_json::Value::String(credential_name),
+                );
+            }
+            value
+        }
+        EnsureReadyOutcome::NeedsSetup {
+            name,
+            kind,
+            instructions,
+            setup_url,
+            ..
+        } => serde_json::json!({
+            "status": "needs_setup",
+            "name": name,
+            "kind": kind,
+            "instructions": instructions,
+            "setup_url": setup_url,
+        }),
+    }
+}
 
 // ── tool_search ──────────────────────────────────────────────────────────
 
@@ -31,8 +112,12 @@ impl Tool for ToolSearchTool {
 
     fn description(&self) -> &str {
         "Search for available extensions to add new capabilities. Extensions include \
-         channels (Telegram, Slack, Discord — for messaging), tools, and MCP servers. \
-         Use discover:true to search online if the built-in registry has no results."
+         channels (Telegram, Slack, Discord — connect messaging platforms so IronClaw can \
+         receive and reply there), tools, and MCP servers. Use `tool_install` for explicit \
+         installation, then call `tool_activate(name=\"...\")` to make a discovered \
+         integration usable. Use the `message` tool for \
+         proactive outbound sends. Use discover:true to search online if the built-in registry \
+         has no results."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -102,7 +187,9 @@ impl Tool for ToolInstallTool {
 
     fn description(&self) -> &str {
         "Install an extension (channel, tool, or MCP server). \
-         Use the name from tool_search results, or provide an explicit URL."
+         Use the name from tool_search results, or provide an explicit URL. \
+         Also discovers tool source code in the working directory \
+         (tools-src/, tool-src/, or direct subdirectories with Cargo.toml)."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -148,16 +235,21 @@ impl Tool for ToolInstallTool {
                 _ => None,
             });
 
-        let result = self
-            .manager
+        self.manager
             .install(name, url, kind_hint, &ctx.user_id)
             .await
             .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
 
-        let output = serde_json::to_value(&result)
-            .unwrap_or_else(|_| serde_json::json!({"error": "serialization failed"}));
+        let result = self
+            .manager
+            .ensure_extension_ready(name, &ctx.user_id, EnsureReadyIntent::PostInstall)
+            .await
+            .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
 
-        Ok(ToolOutput::success(output, start.elapsed()))
+        Ok(ToolOutput::success(
+            output_from_ensure_ready(result),
+            start.elapsed(),
+        ))
     }
 
     fn requires_approval(&self, _params: &serde_json::Value) -> ApprovalRequirement {
@@ -213,46 +305,13 @@ impl Tool for ToolAuthTool {
 
         let result = self
             .manager
-            .auth(name, &ctx.user_id)
+            .ensure_extension_ready(name, &ctx.user_id, EnsureReadyIntent::ExplicitAuth)
             .await
             .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
-
-        // Auto-activate after successful auth so tools are available immediately
-        if result.is_authenticated() {
-            match self.manager.activate(name, &ctx.user_id).await {
-                Ok(activate_result) => {
-                    let output = serde_json::json!({
-                        "status": "authenticated_and_activated",
-                        "name": name,
-                        "tools_loaded": activate_result.tools_loaded,
-                        "message": activate_result.message,
-                    });
-                    return Ok(ToolOutput::success(output, start.elapsed()));
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "Extension '{}' authenticated but activation failed: {}",
-                        name,
-                        e
-                    );
-                    let output = serde_json::json!({
-                        "status": "authenticated",
-                        "name": name,
-                        "activation_error": e.to_string(),
-                        "message": format!(
-                            "Authenticated but activation failed: {}. Try tool_activate.",
-                            e
-                        ),
-                    });
-                    return Ok(ToolOutput::success(output, start.elapsed()));
-                }
-            }
-        }
-
-        let output = serde_json::to_value(&result)
-            .unwrap_or_else(|_| serde_json::json!({"error": "serialization failed"}));
-
-        Ok(ToolOutput::success(output, start.elapsed()))
+        Ok(ToolOutput::success(
+            output_from_ensure_ready(result),
+            start.elapsed(),
+        ))
     }
 
     fn requires_approval(&self, _params: &serde_json::Value) -> ApprovalRequirement {
@@ -263,6 +322,10 @@ impl Tool for ToolAuthTool {
         } else {
             ApprovalRequirement::UnlessAutoApproved
         }
+    }
+
+    fn engine_compatibility(&self) -> EngineCompatibility {
+        EngineCompatibility::V1Only
     }
 }
 
@@ -285,7 +348,8 @@ impl Tool for ToolActivateTool {
     }
 
     fn description(&self) -> &str {
-        "Activate an installed extension — starts channels, loads tools, or connects to MCP servers."
+        "Make an integration usable. This may install, authenticate, and activate it as needed \
+         before loading tools, starting channels, or connecting to MCP servers."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -310,53 +374,16 @@ impl Tool for ToolActivateTool {
 
         let name = require_str(&params, "name")?;
 
-        match self.manager.activate(name, &ctx.user_id).await {
-            Ok(result) => {
-                let output = serde_json::to_value(&result)
-                    .unwrap_or_else(|_| serde_json::json!({"error": "serialization failed"}));
-                Ok(ToolOutput::success(output, start.elapsed()))
-            }
-            Err(activate_err) => {
-                let err_str = activate_err.to_string();
-                let needs_auth = err_str.contains("authentication")
-                    || err_str.contains("401")
-                    || err_str.contains("Unauthorized")
-                    || err_str.contains("not authenticated");
+        let result = self
+            .manager
+            .ensure_extension_ready(name, &ctx.user_id, EnsureReadyIntent::ExplicitActivate)
+            .await
+            .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
 
-                if !needs_auth {
-                    return Err(ToolError::ExecutionFailed(err_str));
-                }
-
-                // Activation failed due to missing auth; initiate auth flow
-                // so the agent loop can show the auth card.
-                match self.manager.auth(name, &ctx.user_id).await {
-                    Ok(auth_result) if auth_result.is_authenticated() => {
-                        // Auth succeeded (e.g. env var was set); retry activation.
-                        let result = self
-                            .manager
-                            .activate(name, &ctx.user_id)
-                            .await
-                            .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
-                        let output = serde_json::to_value(&result).unwrap_or_else(
-                            |_| serde_json::json!({"error": "serialization failed"}),
-                        );
-                        Ok(ToolOutput::success(output, start.elapsed()))
-                    }
-                    Ok(auth_result) => {
-                        // Auth needs user input (awaiting_token). Return the auth
-                        // result so detect_auth_awaiting picks it up.
-                        let output = serde_json::to_value(&auth_result).unwrap_or_else(
-                            |_| serde_json::json!({"error": "serialization failed"}),
-                        );
-                        Ok(ToolOutput::success(output, start.elapsed()))
-                    }
-                    Err(auth_err) => Err(ToolError::ExecutionFailed(format!(
-                        "Activation failed ({}), and authentication also failed: {}",
-                        err_str, auth_err
-                    ))),
-                }
-            }
-        }
+        Ok(ToolOutput::success(
+            output_from_ensure_ready(result),
+            start.elapsed(),
+        ))
     }
 }
 
@@ -364,11 +391,32 @@ impl Tool for ToolActivateTool {
 
 pub struct ToolListTool {
     manager: Arc<ExtensionManager>,
+    registry: Option<Arc<ToolRegistry>>,
+    settings_store: Option<Arc<dyn crate::db::SettingsStore + Send + Sync>>,
 }
 
 impl ToolListTool {
     pub fn new(manager: Arc<ExtensionManager>) -> Self {
-        Self { manager }
+        Self {
+            manager,
+            registry: None,
+            settings_store: None,
+        }
+    }
+
+    /// Attach a tool registry so `kind="builtin"` listings are available.
+    pub fn with_registry(mut self, registry: Arc<ToolRegistry>) -> Self {
+        self.registry = Some(registry);
+        self
+    }
+
+    /// Attach a settings store so permission states can be read per user.
+    pub fn with_settings_store(
+        mut self,
+        store: Arc<dyn crate::db::SettingsStore + Send + Sync>,
+    ) -> Self {
+        self.settings_store = Some(store);
+        self
     }
 }
 
@@ -379,8 +427,9 @@ impl Tool for ToolListTool {
     }
 
     fn description(&self) -> &str {
-        "List extensions with their authentication and activation status. \
-         Set include_available:true to also show registry entries not yet installed."
+        "List extensions and built-in tools with their authentication, activation, and permission \
+         status. Set include_available:true to also show registry entries not yet installed. \
+         Use kind=\"builtin\" to list only built-in Rust tools."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -389,8 +438,8 @@ impl Tool for ToolListTool {
             "properties": {
                 "kind": {
                     "type": "string",
-                    "enum": ["mcp_server", "wasm_tool", "wasm_channel"],
-                    "description": "Filter by extension type (omit to list all)"
+                    "enum": ["mcp_server", "wasm_tool", "wasm_channel", "builtin"],
+                    "description": "Filter by extension type (omit to list all, including builtins)"
                 },
                 "include_available": {
                     "type": "boolean",
@@ -408,31 +457,84 @@ impl Tool for ToolListTool {
     ) -> Result<ToolOutput, ToolError> {
         let start = std::time::Instant::now();
 
-        let kind_filter = params
-            .get("kind")
-            .and_then(|v| v.as_str())
-            .and_then(|k| match k {
-                "mcp_server" => Some(ExtensionKind::McpServer),
-                "wasm_tool" => Some(ExtensionKind::WasmTool),
-                "wasm_channel" => Some(ExtensionKind::WasmChannel),
-                _ => None,
-            });
+        let kind_str = params.get("kind").and_then(|v| v.as_str());
+        let want_builtin = kind_str.is_none() || kind_str == Some("builtin");
+        let want_extensions = kind_str.is_none() || kind_str != Some("builtin");
 
         let include_available = params
             .get("include_available")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        let extensions = self
-            .manager
-            .list(kind_filter, include_available, &ctx.user_id)
-            .await
-            .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
+        // Load per-user permission overrides (best-effort; empty map on any failure).
+        let perm_overrides: std::collections::HashMap<
+            String,
+            crate::tools::permissions::PermissionState,
+        > = if let Some(ref store) = self.settings_store {
+            match store.get_all_settings(&ctx.user_id).await {
+                Ok(map) => {
+                    let settings = crate::settings::Settings::from_db_map(&map);
+                    settings.tool_permissions
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to load tool permissions: {}", e);
+                    std::collections::HashMap::new()
+                }
+            }
+        } else {
+            std::collections::HashMap::new()
+        };
 
-        let output = serde_json::json!({
-            "extensions": extensions,
-            "count": extensions.len(),
-        });
+        let mut output = serde_json::json!({});
+
+        // Built-in tools section — restrict to tools registered via register_sync()
+        // so that dynamically-installed WASM/MCP tools are not duplicated here.
+        if want_builtin && let Some(ref registry) = self.registry {
+            let builtin_names = registry.builtin_tool_names().await;
+            let tools = registry.all().await;
+            let builtin_list: Vec<serde_json::Value> = tools
+                .iter()
+                .filter(|tool| builtin_names.contains(tool.name()))
+                .map(|tool| {
+                    let name = tool.name().to_string();
+                    let perm_state = effective_permission(&name, &perm_overrides);
+                    let default_state =
+                        seeded_default_permission(&name).unwrap_or(PermissionState::AskEachTime);
+                    let locked = tool_permission_locked(tool.as_ref());
+                    serde_json::json!({
+                        "name": name,
+                        "description": tool.description(),
+                        "permission_state": perm_state,
+                        "default_state": default_state,
+                        "locked": locked,
+                        "locked_reason": locked.then_some(TOOL_PERMISSION_LOCKED_REASON),
+                    })
+                })
+                .collect();
+            let count = builtin_list.len();
+            output["builtins"] = serde_json::json!(builtin_list);
+            output["builtin_count"] = serde_json::json!(count);
+        }
+
+        // Extension (MCP / WASM) section.
+        if want_extensions {
+            let kind_filter = kind_str.and_then(|k| match k {
+                "mcp_server" => Some(ExtensionKind::McpServer),
+                "wasm_tool" => Some(ExtensionKind::WasmTool),
+                "wasm_channel" => Some(ExtensionKind::WasmChannel),
+                _ => None,
+            });
+
+            let extensions = self
+                .manager
+                .list(kind_filter, include_available, &ctx.user_id)
+                .await
+                .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
+
+            let count = extensions.len();
+            output["extensions"] = serde_json::json!(extensions);
+            output["count"] = serde_json::json!(count);
+        }
 
         Ok(ToolOutput::success(output, start.elapsed()))
     }
@@ -499,6 +601,10 @@ impl Tool for ToolRemoveTool {
 
     fn requires_approval(&self, _params: &serde_json::Value) -> ApprovalRequirement {
         ApprovalRequirement::Always
+    }
+
+    fn engine_compatibility(&self) -> EngineCompatibility {
+        EngineCompatibility::V1Only
     }
 }
 
@@ -619,6 +725,164 @@ impl Tool for ExtensionInfoTool {
     }
 }
 
+// ── tool_permission_set ───────────────────────────────────────────────────
+
+pub struct ToolPermissionSetTool {
+    registry: Arc<ToolRegistry>,
+    settings_store: Option<Arc<dyn crate::db::SettingsStore + Send + Sync>>,
+}
+
+impl ToolPermissionSetTool {
+    pub fn new(
+        registry: Arc<ToolRegistry>,
+        settings_store: Option<Arc<dyn crate::db::SettingsStore + Send + Sync>>,
+    ) -> Self {
+        Self {
+            registry,
+            settings_store,
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for ToolPermissionSetTool {
+    fn name(&self) -> &str {
+        "tool_permission_set"
+    }
+
+    fn description(&self) -> &str {
+        "Get or set the permission state for a tool. Use to view current permissions or propose \
+         a change (requires user approval). States: always_allow (no prompt), ask_each_time \
+         (approval required), disabled (tool hidden from LLM)."
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "tool_name": {
+                    "type": "string",
+                    "description": "Name of the tool to configure"
+                },
+                "state": {
+                    "type": "string",
+                    "enum": ["always_allow", "ask_each_time", "disabled"],
+                    "description": "New permission state. Omit to just read the current state."
+                }
+            },
+            "required": ["tool_name"]
+        })
+    }
+
+    fn requires_approval(&self, _params: &serde_json::Value) -> ApprovalRequirement {
+        ApprovalRequirement::Always
+    }
+
+    async fn execute(
+        &self,
+        params: serde_json::Value,
+        ctx: &JobContext,
+    ) -> Result<ToolOutput, ToolError> {
+        let start = std::time::Instant::now();
+
+        let tool_name = require_str(&params, "tool_name")?;
+
+        // Verify that the target tool exists in the registry.
+        let target_tool =
+            self.registry.get(tool_name).await.ok_or_else(|| {
+                ToolError::InvalidParameters(format!("Unknown tool: '{tool_name}'"))
+            })?;
+        let locked = tool_permission_locked(target_tool.as_ref());
+
+        // Load current settings for the user.
+        let settings = if let Some(ref store) = self.settings_store {
+            match store.get_all_settings(&ctx.user_id).await {
+                Ok(map) => crate::settings::Settings::from_db_map(&map),
+                Err(e) => {
+                    return Err(ToolError::ExecutionFailed(format!(
+                        "Failed to load settings: {e}"
+                    )));
+                }
+            }
+        } else {
+            crate::settings::Settings::default()
+        };
+
+        let prev_state =
+            crate::tools::permissions::effective_permission(tool_name, &settings.tool_permissions);
+
+        // Read-only mode when no state param; reject non-string state values.
+        let state_str = match params.get("state") {
+            None => {
+                let default_state =
+                    seeded_default_permission(tool_name).unwrap_or(PermissionState::AskEachTime);
+                let output = serde_json::json!({
+                    "tool_name": tool_name,
+                    "current_state": prev_state,
+                    "default_state": default_state,
+                    "locked": locked,
+                    "locked_reason": locked.then_some(TOOL_PERMISSION_LOCKED_REASON),
+                });
+                return Ok(ToolOutput::success(output, start.elapsed()));
+            }
+            Some(v) => v.as_str().ok_or_else(|| {
+                ToolError::InvalidParameters(
+                    "'state' must be a string: always_allow, ask_each_time, or disabled"
+                        .to_string(),
+                )
+            })?,
+        };
+
+        // Parse the requested new state.
+        let new_state = match state_str {
+            "always_allow" => PermissionState::AlwaysAllow,
+            "ask_each_time" => PermissionState::AskEachTime,
+            "disabled" => PermissionState::Disabled,
+            other => {
+                return Err(ToolError::InvalidParameters(format!(
+                    "Invalid state '{other}'; expected always_allow, ask_each_time, or disabled"
+                )));
+            }
+        };
+        if locked && matches!(new_state, PermissionState::AlwaysAllow) {
+            return Err(ToolError::InvalidParameters(format!(
+                "'{tool_name}' always requires approval and cannot be set to always_allow"
+            )));
+        }
+
+        // Persist the updated permission.
+        if let Some(ref store) = self.settings_store {
+            let new_state_json = serde_json::to_value(new_state)
+                .map_err(|e| ToolError::ExecutionFailed(e.to_string()))?;
+            store
+                .set_setting(
+                    &ctx.user_id,
+                    &format!("tool_permissions.{tool_name}"),
+                    &new_state_json,
+                )
+                .await
+                .map_err(|e| {
+                    ToolError::ExecutionFailed(format!("Failed to save permission: {e}"))
+                })?;
+        } else {
+            return Err(ToolError::ExecutionFailed(
+                "No settings store configured — permission changes cannot be persisted".to_string(),
+            ));
+        }
+
+        let output = serde_json::json!({
+            "tool_name": tool_name,
+            "prev_state": prev_state,
+            "new_state": new_state,
+        });
+        Ok(ToolOutput::success(output, start.elapsed()))
+    }
+
+    fn engine_compatibility(&self) -> EngineCompatibility {
+        EngineCompatibility::V1Only
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -632,6 +896,17 @@ mod tests {
         let schema = tool.parameters_schema();
         assert!(schema.get("properties").is_some());
         assert!(schema["properties"].get("query").is_some());
+    }
+
+    #[test]
+    fn test_tool_search_description_clarifies_channel_setup_vs_sending() {
+        let tool = ToolSearchTool {
+            manager: test_manager_stub(),
+        };
+
+        let description = tool.description();
+        assert!(description.contains("call `tool_activate(name=\"...\")`"));
+        assert!(description.contains("Use the `message` tool for proactive outbound sends"));
     }
 
     #[test]
@@ -677,6 +952,10 @@ mod tests {
             manager: test_manager_stub(),
         };
         assert_eq!(tool.name(), "tool_activate");
+        assert!(
+            tool.description()
+                .contains("install, authenticate, and activate")
+        );
         assert_eq!(
             tool.requires_approval(&serde_json::json!({})),
             ApprovalRequirement::Never
@@ -684,11 +963,40 @@ mod tests {
     }
 
     #[test]
+    fn activation_error_requires_auth_detects_auth_required_variants() {
+        assert!(activation_error_requires_auth("Authentication required"));
+        assert!(activation_error_requires_auth("not authenticated"));
+        assert!(activation_error_requires_auth("401 unauthorized"));
+        assert!(activation_error_requires_auth("Unauthorized"));
+        assert!(!activation_error_requires_auth(
+            "Activation failed: crashed"
+        ));
+    }
+
+    #[test]
+    fn output_from_ensure_ready_needs_auth_includes_credential_name() {
+        let output = output_from_ensure_ready(EnsureReadyOutcome::NeedsAuth {
+            name: "web_search".to_string(),
+            kind: ExtensionKind::WasmTool,
+            phase: crate::extensions::ExtensionPhase::NeedsAuth,
+            credential_name: Some("search_api_key".to_string()),
+            auth: crate::extensions::AuthResult::awaiting_token(
+                "web_search",
+                ExtensionKind::WasmTool,
+                "Enter API key".to_string(),
+                None,
+            ),
+        });
+
+        assert_eq!(output["status"], "awaiting_token");
+        assert_eq!(output["name"], "web_search");
+        assert_eq!(output["credential_name"], "search_api_key");
+    }
+
+    #[test]
     fn test_tool_list_schema() {
         use crate::tools::tool::ApprovalRequirement;
-        let tool = ToolListTool {
-            manager: test_manager_stub(),
-        };
+        let tool = ToolListTool::new(test_manager_stub());
         assert_eq!(tool.name(), "tool_list");
         assert_eq!(
             tool.requires_approval(&serde_json::json!({})),
@@ -696,6 +1004,15 @@ mod tests {
         );
         let schema = tool.parameters_schema();
         assert!(schema["properties"].get("kind").is_some());
+        // Verify the new "builtin" kind is included in the enum.
+        let enum_vals = schema["properties"]["kind"]["enum"]
+            .as_array()
+            .expect("kind must have an enum array");
+        let kind_names: Vec<&str> = enum_vals.iter().filter_map(|v| v.as_str()).collect();
+        assert!(
+            kind_names.contains(&"builtin"),
+            "tool_list kind enum must include 'builtin'"
+        );
     }
 
     #[test]
@@ -811,5 +1128,243 @@ mod tests {
             None,
             Vec::new(),
         ))
+    }
+
+    // ── tool_permission_set tests ─────────────────────────────────────────
+
+    /// A simple tool used in tests that requires approval Always (locked).
+    struct LockedTool;
+
+    #[async_trait]
+    impl Tool for LockedTool {
+        fn name(&self) -> &str {
+            "locked_tool"
+        }
+        fn description(&self) -> &str {
+            "A test tool that always requires approval"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object", "properties": {} })
+        }
+        async fn execute(
+            &self,
+            _params: serde_json::Value,
+            _ctx: &JobContext,
+        ) -> Result<ToolOutput, ToolError> {
+            unreachable!()
+        }
+        fn requires_approval(&self, _params: &serde_json::Value) -> ApprovalRequirement {
+            ApprovalRequirement::Always
+        }
+    }
+
+    /// A simple tool used in tests that does not lock its permission.
+    struct NormalTool;
+
+    #[async_trait]
+    impl Tool for NormalTool {
+        fn name(&self) -> &str {
+            "normal_tool"
+        }
+        fn description(&self) -> &str {
+            "A normal test tool"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object", "properties": {} })
+        }
+        async fn execute(
+            &self,
+            _params: serde_json::Value,
+            _ctx: &JobContext,
+        ) -> Result<ToolOutput, ToolError> {
+            unreachable!()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_tool_permission_set_unknown_tool_returns_error() {
+        use crate::context::JobContext;
+        use crate::tools::ToolRegistry;
+
+        let registry = Arc::new(ToolRegistry::new());
+        // Do not register any tool — asking for "unknown_xyz" should fail.
+        let tool = ToolPermissionSetTool::new(Arc::clone(&registry), None);
+        let ctx = JobContext::default();
+        let result = tool
+            .execute(serde_json::json!({"tool_name": "unknown_xyz"}), &ctx) // safety: Tool::execute, not DB
+            .await;
+        assert!(result.is_err(), "expected error for unknown tool");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, ToolError::InvalidParameters(_)),
+            "expected InvalidParameters, got {err:?}"
+        );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn test_tool_permission_set_rejects_intrinsic_approval_override() {
+        use crate::context::JobContext;
+        use crate::db::SettingsStore;
+        use crate::tools::ToolRegistry;
+
+        let registry = Arc::new(ToolRegistry::new());
+        registry.register(Arc::new(LockedTool)).await;
+        let (db, _tmp) = crate::testing::test_db().await;
+        let store: Arc<dyn SettingsStore + Send + Sync> = db;
+
+        let tool = ToolPermissionSetTool::new(Arc::clone(&registry), Some(store));
+        let ctx = JobContext::default();
+
+        let result = tool
+            .execute(
+                serde_json::json!({"tool_name": "locked_tool", "state": "always_allow"}),
+                &ctx,
+            )
+            .await
+            .expect_err("locked tool should reject always_allow");
+
+        assert!(
+            matches!(result, ToolError::InvalidParameters(_)),
+            "expected InvalidParameters for locked always_allow, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tool_permission_set_reports_locked_metadata() {
+        use crate::context::JobContext;
+        use crate::tools::ToolRegistry;
+
+        let registry = Arc::new(ToolRegistry::new());
+        registry.register(Arc::new(LockedTool)).await;
+
+        let tool = ToolPermissionSetTool::new(Arc::clone(&registry), None);
+        let ctx = JobContext::default();
+
+        let result = tool
+            .execute(serde_json::json!({"tool_name": "locked_tool"}), &ctx)
+            .await
+            .expect("read-only permission lookup should succeed without store");
+
+        assert_eq!(result.result["tool_name"], "locked_tool");
+        assert_eq!(result.result["locked"], true);
+        assert!(
+            result.result["locked_reason"].is_string(),
+            "locked read path should include locked_reason"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tool_permission_set_without_store_returns_error() {
+        use crate::context::JobContext;
+        use crate::tools::ToolRegistry;
+
+        let registry = Arc::new(ToolRegistry::new());
+        registry.register(Arc::new(NormalTool)).await;
+
+        let tool = ToolPermissionSetTool::new(Arc::clone(&registry), None);
+        let ctx = JobContext::default();
+
+        let result = tool
+            .execute(
+                serde_json::json!({"tool_name": "normal_tool", "state": "always_allow"}),
+                &ctx,
+            )
+            .await;
+        assert!(result.is_err(), "missing settings store should be rejected");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, ToolError::ExecutionFailed(_)),
+            "expected ExecutionFailed for missing store, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_tool_permission_set_always_requires_approval() {
+        use crate::tools::ToolRegistry;
+
+        let registry = Arc::new(ToolRegistry::new());
+        let tool = ToolPermissionSetTool::new(Arc::clone(&registry), None);
+        assert_eq!(
+            tool.requires_approval(&serde_json::json!({})),
+            ApprovalRequirement::Always,
+            "tool_permission_set must always require approval"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tool_list_includes_builtin_kind() {
+        use crate::context::JobContext;
+        use crate::tools::ToolRegistry;
+
+        let registry = Arc::new(ToolRegistry::new());
+        // Use register_sync (built-in path) so the tool appears in builtin_tool_names().
+        registry.register_sync(Arc::new(NormalTool));
+        registry.register_sync(Arc::new(LockedTool));
+
+        let manager = test_manager_stub();
+        let list_tool = ToolListTool::new(manager).with_registry(Arc::clone(&registry));
+
+        let ctx = JobContext::default();
+        let result = list_tool
+            .execute(serde_json::json!({"kind": "builtin"}), &ctx) // safety: Tool::execute, not DB
+            .await
+            .expect("tool_list kind=builtin should succeed");
+
+        let builtins = result.result["builtins"]
+            .as_array()
+            .expect("result should have builtins array");
+        assert!(
+            !builtins.is_empty(),
+            "builtins list should not be empty when registry has tools"
+        );
+        let names: Vec<&str> = builtins
+            .iter()
+            .filter_map(|entry| entry["name"].as_str())
+            .collect();
+        assert!(
+            names.contains(&"normal_tool"),
+            "registered normal_tool should appear in builtins listing"
+        );
+        assert!(
+            names.contains(&"locked_tool"),
+            "registered locked_tool should appear in builtins listing"
+        );
+        // Each entry must have required fields.
+        for entry in builtins {
+            assert!(entry.get("name").is_some(), "missing name field");
+            assert!(
+                entry.get("description").is_some(),
+                "missing description field"
+            );
+            assert!(
+                entry.get("permission_state").is_some(),
+                "missing permission_state"
+            );
+            assert!(
+                entry.get("default_state").is_some(),
+                "missing default_state"
+            );
+            assert!(entry.get("locked").is_some(), "missing locked field");
+        }
+        let locked_entry = builtins
+            .iter()
+            .find(|entry| entry["name"] == "locked_tool")
+            .expect("locked_tool entry should be present");
+        assert_eq!(locked_entry["locked"], true);
+        assert!(
+            locked_entry["locked_reason"].is_string(),
+            "locked builtin entry should include locked_reason"
+        );
+        let normal_entry = builtins
+            .iter()
+            .find(|entry| entry["name"] == "normal_tool")
+            .expect("normal_tool entry should be present");
+        assert_eq!(normal_entry["locked"], false);
+        // Extensions should not be present for kind=builtin.
+        assert!(
+            result.result.get("extensions").is_none(),
+            "kind=builtin should not return extensions"
+        );
     }
 }

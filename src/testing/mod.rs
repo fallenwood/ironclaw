@@ -504,7 +504,7 @@ impl TestHarnessBuilder {
         use crate::agent::cost_guard::{CostGuard, CostGuardConfig};
         use crate::config::{SafetyConfig, SkillsConfig};
         use crate::hooks::HookRegistry;
-        use crate::safety::SafetyLayer;
+        use ironclaw_safety::SafetyLayer;
 
         let (db, temp_dir) = if let Some(db) = self.db {
             // Caller provided a DB; create a dummy temp dir to satisfy the struct.
@@ -532,6 +532,7 @@ impl TestHarnessBuilder {
         let cost_guard = Arc::new(CostGuard::new(CostGuardConfig {
             max_cost_per_day_cents: None,
             max_actions_per_hour: None,
+            max_cost_per_user_per_day_cents: None,
         }));
 
         let channel = if self.stub_channel {
@@ -546,6 +547,7 @@ impl TestHarnessBuilder {
         let deps = AgentDeps {
             owner_id: "default".to_string(),
             store: Some(Arc::clone(&db)),
+            settings_store: None,
             llm,
             cheap_llm: None,
             safety,
@@ -556,6 +558,7 @@ impl TestHarnessBuilder {
             skill_catalog: None,
             skills_config: SkillsConfig::default(),
             hooks,
+            auth_manager: None,
             cost_guard,
             sse_tx: None,
             http_interceptor: None,
@@ -564,6 +567,7 @@ impl TestHarnessBuilder {
             sandbox_readiness: crate::agent::routine_engine::SandboxReadiness::DisabledByConfig,
             builder: None,
             llm_backend: "nearai".to_string(),
+            tenant_rates: std::sync::Arc::new(crate::tenant::TenantRateRegistry::new(4, 3)),
         };
 
         TestHarness {
@@ -751,7 +755,7 @@ mod tests {
 
         // ensure_conversation should create the row.
         assert!(
-            db.ensure_conversation(conv_id, "web", "carol", None)
+            db.ensure_conversation(conv_id, "web", "carol", None, Some("web"))
                 .await
                 .expect("ensure first"),
             "first ensure_conversation should create the row"
@@ -759,7 +763,7 @@ mod tests {
 
         // Calling again with the same ID should not error.
         assert!(
-            db.ensure_conversation(conv_id, "web", "carol", None)
+            db.ensure_conversation(conv_id, "web", "carol", None, Some("web"))
                 .await
                 .expect("ensure second (idempotent)"),
             "second ensure_conversation should touch owned row"
@@ -804,7 +808,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
 
         assert!(
-            !db.ensure_conversation(conv_id, "web", "mallory", None)
+            !db.ensure_conversation(conv_id, "web", "mallory", None, None)
                 .await
                 .expect("foreign ensure should not error"),
             "foreign ensure_conversation should report not ensured"
@@ -822,6 +826,48 @@ mod tests {
         assert_eq!(
             after, before,
             "foreign ensure_conversation should not mutate last_activity"
+        );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn test_ensure_conversation_backfills_legacy_source_channel() {
+        let harness = TestHarnessBuilder::new().build().await;
+        let db = &harness.db;
+
+        let conv_id = uuid::Uuid::new_v4();
+
+        assert!(
+            db.ensure_conversation(conv_id, "gateway", "carol", None, None)
+                .await
+                .expect("ensure legacy conversation"),
+            "legacy ensure should create the row"
+        );
+
+        let source_before = db
+            .get_conversation_source_channel(conv_id)
+            .await
+            .expect("read source channel before backfill");
+        assert!(
+            source_before.is_none(),
+            "legacy conversation should start with NULL source_channel"
+        );
+
+        assert!(
+            db.ensure_conversation(conv_id, "gateway", "carol", None, Some("gateway"))
+                .await
+                .expect("ensure backfill conversation"),
+            "owned ensure should backfill the legacy row"
+        );
+
+        let source_after = db
+            .get_conversation_source_channel(conv_id)
+            .await
+            .expect("read source channel after backfill");
+        assert_eq!(
+            source_after.as_deref(),
+            Some("gateway"),
+            "ensure_conversation should backfill a legacy NULL source_channel"
         );
     }
 
@@ -1404,6 +1450,8 @@ mod tests {
             started_at: None,
             completed_at: None,
             credential_grants_json: "[]".to_string(),
+            mcp_servers: None,
+            max_iterations: None,
         };
 
         // Create
@@ -1499,6 +1547,8 @@ mod tests {
             started_at: None,
             completed_at: None,
             credential_grants_json: "[]".to_string(),
+            mcp_servers: None,
+            max_iterations: None,
         };
         db.save_sandbox_job(&job).await.expect("save");
 
@@ -1541,6 +1591,8 @@ mod tests {
             started_at: Some(chrono::Utc::now()),
             completed_at: None,
             credential_grants_json: "[]".to_string(),
+            mcp_servers: None,
+            max_iterations: None,
         };
         db.save_sandbox_job(&job).await.expect("save job");
 

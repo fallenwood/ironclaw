@@ -211,7 +211,9 @@ impl GithubCopilotProvider {
 #[async_trait]
 impl LlmProvider for GithubCopilotProvider {
     async fn complete(&self, mut req: CompletionRequest) -> Result<CompletionResponse, LlmError> {
-        let model = req.model.take().unwrap_or_else(|| self.active_model_name());
+        let model = req
+            .take_model_override()
+            .unwrap_or_else(|| self.active_model_name());
         self.strip_unsupported_completion_params(&mut req);
         let messages = convert_messages(req.messages);
 
@@ -231,9 +233,8 @@ impl LlmProvider for GithubCopilotProvider {
                 .choices
                 .into_iter()
                 .next()
-                .ok_or_else(|| LlmError::InvalidResponse {
+                .ok_or_else(|| LlmError::EmptyResponse {
                     provider: "github_copilot".to_string(),
-                    reason: "No choices in response".to_string(),
                 })?;
 
         let (content, _tool_calls) = extract_choice_content(&choice);
@@ -268,7 +269,9 @@ impl LlmProvider for GithubCopilotProvider {
         &self,
         mut req: ToolCompletionRequest,
     ) -> Result<ToolCompletionResponse, LlmError> {
-        let model = req.model.take().unwrap_or_else(|| self.active_model_name());
+        let model = req
+            .take_model_override()
+            .unwrap_or_else(|| self.active_model_name());
         self.strip_unsupported_tool_params(&mut req);
         let messages = convert_messages(req.messages);
 
@@ -309,9 +312,8 @@ impl LlmProvider for GithubCopilotProvider {
                 .choices
                 .into_iter()
                 .next()
-                .ok_or_else(|| LlmError::InvalidResponse {
+                .ok_or_else(|| LlmError::EmptyResponse {
                     provider: "github_copilot".to_string(),
-                    reason: "No choices in response".to_string(),
                 })?;
 
         let (content, tool_calls) = extract_choice_content(&choice);
@@ -429,6 +431,7 @@ enum OpenAiContentPart {
 #[derive(Debug, Serialize)]
 struct OpenAiImageUrl {
     url: String,
+    detail: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -527,8 +530,12 @@ fn convert_messages(messages: Vec<ChatMessage>) -> Vec<OpenAiMessage> {
                                 parts.push(OpenAiContentPart::Text { text });
                             }
                             ContentPart::ImageUrl { image_url } => {
+                                let detail = image_url.normalized_openai_detail();
                                 parts.push(OpenAiContentPart::ImageUrl {
-                                    image_url: OpenAiImageUrl { url: image_url.url },
+                                    image_url: OpenAiImageUrl {
+                                        url: image_url.url,
+                                        detail,
+                                    },
                                 });
                             }
                         }
@@ -596,6 +603,7 @@ fn extract_choice_content(choice: &OpenAiChoice) -> (Option<String>, Vec<ToolCal
                     name: tc.function.name.clone(),
                     arguments: serde_json::from_str(&tc.function.arguments)
                         .unwrap_or(serde_json::Value::Object(serde_json::Map::new())),
+                    reasoning: None,
                 })
                 .collect()
         })
@@ -628,6 +636,7 @@ mod tests {
             id: "call_1".to_string(),
             name: "search".to_string(),
             arguments: serde_json::json!({"q": "test"}),
+            reasoning: None,
         }];
         let messages = vec![
             ChatMessage::user("Search"),
@@ -639,6 +648,46 @@ mod tests {
         assert!(converted[1].tool_calls.is_some());
         assert_eq!(converted[2].role, "tool");
         assert_eq!(converted[2].tool_call_id, Some("call_1".to_string()));
+    }
+
+    #[test]
+    fn test_convert_messages_defaults_missing_image_detail_to_auto() {
+        let messages = vec![ChatMessage::user_with_parts(
+            "describe this",
+            vec![ContentPart::ImageUrl {
+                image_url: crate::llm::ImageUrl {
+                    url: "data:image/jpeg;base64,Zm9v".to_string(),
+                    detail: None,
+                },
+            }],
+        )];
+
+        let converted = convert_messages(messages);
+        let content = serde_json::to_value(&converted[0].content).expect("serialize content");
+        assert_eq!(
+            content[1]["image_url"]["url"],
+            "data:image/jpeg;base64,Zm9v"
+        );
+        assert_eq!(content[1]["image_url"]["detail"], "auto");
+    }
+
+    #[test]
+    fn test_convert_messages_preserves_explicit_image_detail() {
+        for expected in ["low", "high"] {
+            let messages = vec![ChatMessage::user_with_parts(
+                "describe this",
+                vec![ContentPart::ImageUrl {
+                    image_url: crate::llm::ImageUrl {
+                        url: format!("https://example.com/{expected}.png"),
+                        detail: Some(expected.to_string()),
+                    },
+                }],
+            )];
+
+            let converted = convert_messages(messages);
+            let content = serde_json::to_value(&converted[0].content).expect("serialize content");
+            assert_eq!(content[1]["image_url"]["detail"], expected);
+        }
     }
 
     #[test]

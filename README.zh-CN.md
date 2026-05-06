@@ -18,7 +18,8 @@
   <a href="README.md">English</a> |
   <a href="README.zh-CN.md">简体中文</a> |
   <a href="README.ru.md">Русский</a> |
-  <a href="README.ja.md">日本語</a>
+  <a href="README.ja.md">日本語</a> |
+  <a href="README.ko.md">한국어</a>
 </p>
 
 <p align="center">
@@ -181,7 +182,7 @@ LLM_API_KEY=sk-or-...
 LLM_MODEL=anthropic/claude-sonnet-4
 ```
 
-详见 [docs/LLM_PROVIDERS.md](docs/LLM_PROVIDERS.md) 获取完整的提供商指南。
+详见 [docs/capabilities/llm-providers.md](docs/capabilities/llm-providers.md) 获取完整的提供商指南。
 
 ## 安全机制
 
@@ -276,15 +277,26 @@ WASM ──► 白名单  ──► 泄露扫描 ──► 凭据  ──► 执
 
 ## 使用方式
 
+Engine v2 当前需要显式开启。如果你想运行新的引擎而不是旧的代理循环，请在启动 IronClaw 时设置 `ENGINE_V2=true`。
+
 ```bash
 # 首次设置（配置数据库、认证等）
 ironclaw onboard
 
-# 启动交互式 REPL
+# 启动已安装的二进制
+ironclaw
+
+# 使用 Engine v2 启动已安装的二进制
+ENGINE_V2=true ironclaw
+
+# 从源码启动交互式 REPL
 cargo run
 
-# 启用调试日志
-RUST_LOG=ironclaw=debug cargo run
+# 从源码启动 Engine v2 交互式 REPL
+ENGINE_V2=true cargo run
+
+# 使用 Engine v2 并启用调试日志
+ENGINE_V2=true RUST_LOG=ironclaw=debug cargo run
 ```
 
 ## 开发
@@ -304,7 +316,7 @@ cargo test
 cargo test test_name
 ```
 
-- **Telegram 渠道**：参见 [docs/TELEGRAM_SETUP.md](docs/TELEGRAM_SETUP.md) 了解设置和私信配对。
+- **渠道**：参见 [docs/channels/overview.mdx](docs/channels/overview.mdx) 了解 Telegram、Discord 和其他渠道的设置。
 - **修改渠道源码**：在 `cargo build` 之前运行 `./channels-src/telegram/build.sh` 以便打包更新后的 WASM。
 
 ## OpenClaw 传承

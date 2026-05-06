@@ -22,6 +22,7 @@ use uuid::Uuid;
 
 use crate::channels::{
     AttachmentKind, Channel, ChannelSecretUpdater, IncomingAttachment, IncomingMessage,
+    MAX_INLINE_ATTACHMENT_BYTES, MAX_INLINE_ATTACHMENTS, MAX_INLINE_TOTAL_ATTACHMENT_BYTES,
     MessageStream, OutgoingResponse,
 };
 use crate::config::HttpConfig;
@@ -167,13 +168,6 @@ struct AttachmentData {
     #[serde(default)]
     url: Option<String>,
 }
-
-/// Maximum size per attachment (5 MB decoded).
-const MAX_ATTACHMENT_BYTES: usize = 5 * 1024 * 1024;
-/// Maximum total attachment size (10 MB decoded).
-const MAX_TOTAL_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
-/// Maximum number of attachments per request.
-const MAX_ATTACHMENTS: usize = 5;
 
 #[derive(Debug, Serialize)]
 struct WebhookResponse {
@@ -452,13 +446,16 @@ async fn process_authenticated_request(
     let wait_for_response = req.wait_for_response;
 
     let attachments = if !req.attachments.is_empty() {
-        if req.attachments.len() > MAX_ATTACHMENTS {
+        if req.attachments.len() > MAX_INLINE_ATTACHMENTS {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(WebhookResponse {
                     message_id: Uuid::nil(),
                     status: "error".to_string(),
-                    response: Some(format!("Too many attachments (max {})", MAX_ATTACHMENTS)),
+                    response: Some(format!(
+                        "Too many attachments (max {})",
+                        MAX_INLINE_ATTACHMENTS
+                    )),
                 }),
             )
                 .into_response();
@@ -483,7 +480,7 @@ async fn process_authenticated_request(
                             .into_response();
                     }
                 };
-                if data.len() > MAX_ATTACHMENT_BYTES {
+                if data.len() > MAX_INLINE_ATTACHMENT_BYTES {
                     return (
                         StatusCode::PAYLOAD_TOO_LARGE,
                         Json(WebhookResponse {
@@ -491,14 +488,14 @@ async fn process_authenticated_request(
                             status: "error".to_string(),
                             response: Some(format!(
                                 "Attachment too large (max {} bytes)",
-                                MAX_ATTACHMENT_BYTES
+                                MAX_INLINE_ATTACHMENT_BYTES
                             )),
                         }),
                     )
                         .into_response();
                 }
                 total_bytes += data.len();
-                if total_bytes > MAX_TOTAL_ATTACHMENT_BYTES {
+                if total_bytes > MAX_INLINE_TOTAL_ATTACHMENT_BYTES {
                     return (
                         StatusCode::PAYLOAD_TOO_LARGE,
                         Json(WebhookResponse {
@@ -517,6 +514,7 @@ async fn process_authenticated_request(
                     size_bytes: Some(data.len() as u64),
                     source_url: None,
                     storage_key: None,
+                    local_path: None,
                     extracted_text: None,
                     data,
                     duration_secs: None,
@@ -530,6 +528,7 @@ async fn process_authenticated_request(
                     size_bytes: None,
                     source_url: Some(url.clone()),
                     storage_key: None,
+                    local_path: None,
                     extracted_text: None,
                     data: Vec::new(),
                     duration_secs: None,
@@ -543,7 +542,6 @@ async fn process_authenticated_request(
 
     let sender_id = normalized_user_id.unwrap_or(&state.user_id).to_string();
     let mut msg = IncomingMessage::new("http", &state.user_id, &req.content)
-        .with_owner_id(&state.user_id)
         .with_sender_id(sender_id)
         .with_metadata(serde_json::json!({
             "wait_for_response": wait_for_response,
@@ -553,8 +551,18 @@ async fn process_authenticated_request(
         msg = msg.with_attachments(attachments);
     }
 
-    if let Some(thread_id) = &req.thread_id {
-        msg = msg.with_thread(thread_id);
+    if let Some(thread_id) = &req.thread_id
+        && let Err(e) = msg.try_with_thread(thread_id)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(WebhookResponse {
+                message_id: Uuid::nil(),
+                status: "error".to_string(),
+                response: Some(format!("Invalid thread_id: {}", e)),
+            }),
+        )
+            .into_response();
     }
 
     process_message(state, msg, wait_for_response)
@@ -879,7 +887,7 @@ mod tests {
             .expect("timed out waiting for webhook message")
             .expect("stream should yield a webhook message");
         assert_eq!(msg.sender_id, "http");
-        assert_eq!(msg.owner_id, "http");
+        assert_eq!(msg.user_id, "http");
     }
 
     #[tokio::test]
@@ -911,7 +919,7 @@ mod tests {
             .expect("timed out waiting for webhook message")
             .expect("stream should yield a webhook message");
         assert_eq!(msg.sender_id, "alice");
-        assert_eq!(msg.owner_id, "http");
+        assert_eq!(msg.user_id, "http");
     }
 
     /// Regression test for issue #869: RwLock read guard was held across

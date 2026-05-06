@@ -233,7 +233,9 @@ fn is_transient(err: &LlmError) -> bool {
         err,
         LlmError::RequestFailed { .. }
             | LlmError::RateLimited { .. }
+            | LlmError::BadGateway { .. }
             | LlmError::InvalidResponse { .. }
+            | LlmError::EmptyResponse { .. }
             | LlmError::SessionExpired { .. }
             | LlmError::SessionRenewalFailed { .. }
             | LlmError::Http(_)

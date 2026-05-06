@@ -26,7 +26,10 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer, reload};
 
-use crate::safety::LeakDetector;
+use ironclaw_common::AppEvent;
+use ironclaw_safety::LeakDetector;
+
+use super::platform::sse::SseManager;
 
 /// Maximum number of recent log entries kept for late-joining SSE subscribers.
 const HISTORY_CAP: usize = 500;
@@ -174,7 +177,14 @@ impl LogLevelHandle {
 ///
 /// Returns the `LogLevelHandle` so callers can swap the filter at runtime.
 /// The fmt layer and `WebLogLayer` are attached alongside the reloadable filter.
-pub fn init_tracing(log_broadcaster: Arc<LogBroadcaster>) -> Arc<LogLevelHandle> {
+///
+/// When `suppress_stderr` is true, the stderr formatter is omitted. This is
+/// used in TUI mode where logs are displayed in the dedicated Logs tab instead
+/// of interleaving with the alternate screen.
+pub fn init_tracing(
+    log_broadcaster: Arc<LogBroadcaster>,
+    suppress_stderr: bool,
+) -> Arc<LogLevelHandle> {
     let raw_filter =
         std::env::var("RUST_LOG").unwrap_or_else(|_| "ironclaw=info,tower_http=warn".to_string());
 
@@ -203,13 +213,19 @@ pub fn init_tracing(log_broadcaster: Arc<LogBroadcaster>) -> Arc<LogLevelHandle>
         base_filter,
     ));
 
-    tracing_subscriber::registry()
-        .with(reload_layer)
-        .with(
+    let fmt_layer = if suppress_stderr {
+        None
+    } else {
+        Some(
             tracing_subscriber::fmt::layer()
                 .with_target(false)
                 .with_writer(crate::tracing_fmt::TruncatingStderr::default()),
         )
+    };
+
+    tracing_subscriber::registry()
+        .with(reload_layer)
+        .with(fmt_layer)
         .with(WebLogLayer::new(log_broadcaster))
         .init();
 
@@ -283,6 +299,66 @@ impl WebLogLayer {
     pub fn new(broadcaster: Arc<LogBroadcaster>) -> Self {
         Self { broadcaster }
     }
+}
+
+/// Forward WARN/ERROR log entries into the chat SSE stream as
+/// `AppEvent::Warning` so the debug inspector's Activity tab can surface
+/// warnings alongside tool/LLM events.
+///
+/// The event is verbose-only at the `SseManager` layer, so only debug
+/// subscribers receive it. When `owner_id` is `Some`, warnings are
+/// scoped to that user to avoid leaking per-request log context across
+/// tenants in multi-tenant deployments; in single-user mode they may be
+/// broadcast globally.
+///
+/// Lag recovery: `broadcast::Receiver::recv()` returns
+/// `Err(RecvError::Lagged)` when the subscriber falls behind. Early code
+/// used `while let Ok(entry) = rx.recv().await`, which would permanently
+/// kill the bridge during a log storm. The `match` shape here keeps the
+/// loop alive on lag and exits only when the broadcaster closes.
+pub fn spawn_warning_bridge(
+    broadcaster: Arc<LogBroadcaster>,
+    sse: Arc<SseManager>,
+    owner_id: Option<String>,
+) {
+    let mut rx = broadcaster.subscribe();
+    tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(entry) => {
+                    if entry.level != "WARN" && entry.level != "ERROR" {
+                        continue;
+                    }
+                    // `AppEvent::Warning` is verbose-only: if no debug
+                    // subscriber is connected there is nobody to deliver
+                    // to, and broadcasting would just pressure the
+                    // shared SSE buffer for non-debug clients.
+                    if !sse.has_verbose_receivers() {
+                        continue;
+                    }
+                    let event = AppEvent::Warning {
+                        source: entry.target,
+                        message: entry.message,
+                        thread_id: None,
+                    };
+                    // The tracing `LogBroadcaster` is a typed source log in
+                    // the sense of `.claude/rules/gateway-events.md`: every
+                    // `AppEvent::Warning` on the SSE stream projects from
+                    // exactly one `LogEntry` produced by `WebLogLayer`.
+                    // It is not yet listed in the rule's source-log table
+                    // (the current entries are engine `EventKind`, sandbox
+                    // `JobEvent`, and channel-lifecycle logs), so the
+                    // broadcast sites carry an explicit annotation below.
+                    match &owner_id {
+                        Some(uid) => sse.broadcast_for_user(uid, event), // projection-exempt: log source, WARN/ERROR tracing bridge → AppEvent::Warning
+                        None => sse.broadcast(event), // projection-exempt: log source, WARN/ERROR tracing bridge → AppEvent::Warning
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
 }
 
 impl<S: tracing::Subscriber> Layer<S> for WebLogLayer {
@@ -454,7 +530,7 @@ mod tests {
 
     #[test]
     fn test_leak_detector_scrubs_api_key_in_log() {
-        let detector = crate::safety::LeakDetector::new();
+        let detector = ironclaw_safety::LeakDetector::new();
         let msg = "Connecting with token sk-proj-test1234567890abcdefghij";
         let result = detector.scan_and_clean(msg);
         // Should be blocked (OpenAI key pattern)
@@ -463,7 +539,7 @@ mod tests {
 
     #[test]
     fn test_leak_detector_passes_clean_log() {
-        let detector = crate::safety::LeakDetector::new();
+        let detector = ironclaw_safety::LeakDetector::new();
         let msg = "Request completed status=200 url=https://api.example.com/data";
         let result = detector.scan_and_clean(msg);
         assert!(result.is_ok());

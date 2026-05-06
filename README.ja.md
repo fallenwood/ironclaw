@@ -18,7 +18,8 @@
   <a href="README.md">English</a> |
   <a href="README.zh-CN.md">简体中文</a> |
   <a href="README.ru.md">Русский</a> |
-  <a href="README.ja.md">日本語</a>
+  <a href="README.ja.md">日本語</a> |
+  <a href="README.ko.md">한국어</a>
 </p>
 
 <p align="center">
@@ -180,7 +181,7 @@ LLM_API_KEY=sk-or-...
 LLM_MODEL=anthropic/claude-sonnet-4
 ```
 
-完全なプロバイダーガイドは[docs/LLM_PROVIDERS.md](docs/LLM_PROVIDERS.md)をご覧ください。
+完全なプロバイダーガイドは[docs/capabilities/llm-providers.md](docs/capabilities/llm-providers.md)をご覧ください。
 
 ## セキュリティ
 
@@ -278,15 +279,26 @@ WASM ──► 許可リスト ──► リーク    ──► 認証情報 ─
 
 ## 使い方
 
+Engine v2 は現在オプトインです。従来のエージェントループではなく新しいエンジンを使いたい場合は、IronClaw を `ENGINE_V2=true` 付きで起動してください。
+
 ```bash
 # 初回セットアップ（データベース、認証などを設定）
 ironclaw onboard
 
-# インタラクティブREPLを起動
+# インストール済みバイナリを起動
+ironclaw
+
+# Engine v2 でインストール済みバイナリを起動
+ENGINE_V2=true ironclaw
+
+# ソースからインタラクティブREPLを起動
 cargo run
 
-# デバッグログ付き
-RUST_LOG=ironclaw=debug cargo run
+# ソースから Engine v2 のインタラクティブREPLを起動
+ENGINE_V2=true cargo run
+
+# Engine v2 をデバッグログ付きで起動
+ENGINE_V2=true RUST_LOG=ironclaw=debug cargo run
 ```
 
 ## 開発
@@ -306,7 +318,7 @@ cargo test
 cargo test test_name
 ```
 
-- **Telegramチャネル**: セットアップとDMペアリングについては[docs/TELEGRAM_SETUP.md](docs/TELEGRAM_SETUP.md)を参照してください。
+- **チャネル**: Telegram、Discord、その他のチャネルの設定は[docs/channels/overview.mdx](docs/channels/overview.mdx)を参照してください。
 - **チャネルソースの変更**: `cargo build`の前に`./channels-src/telegram/build.sh`を実行して、更新されたWASMをバンドルしてください。
 
 ## OpenClawの系譜
